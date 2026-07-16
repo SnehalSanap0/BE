@@ -11,7 +11,7 @@ import json
 import torch
 
 from configs.config import CONFIG
-from datasets.dataloader import build_dataloader
+from dataset.dataloader import build_dataloader
 from evaluation.evaluator import Evaluator
 from models.model_factory import build_model
 from training.checkpoint import BEST_CHECKPOINT_FILENAME, CheckpointManager

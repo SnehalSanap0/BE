@@ -16,7 +16,7 @@ def build_loss_fn(class_weights: torch.Tensor | None = None) -> nn.Module:
     Args:
         class_weights: Optional per-class weight tensor of shape
             ``(num_classes,)``, ordered per
-            :data:`datasets.deepfake_dataset.LABEL_TO_INDEX`. Pass this when
+            :data:`dataset.deepfake_dataset.LABEL_TO_INDEX`. Pass this when
             the real/fake class counts are imbalanced, to avoid the loss
             being dominated by the majority class.
 

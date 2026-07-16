@@ -6,7 +6,7 @@ Usage:
 
 from __future__ import annotations
 
-from datasets.dataloader import build_dataloader
+from dataset.dataloader import build_dataloader
 from models.model_factory import build_model
 from training.trainer import Trainer
 from utils.logger import get_logger

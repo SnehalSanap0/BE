@@ -20,7 +20,7 @@ import torch
 from torch import nn
 
 from configs.config import CONFIG
-from datasets.deepfake_dataset import INDEX_TO_LABEL
+from dataset.deepfake_dataset import INDEX_TO_LABEL
 from explainability.gradcam import GradCAMExplainer
 from explainability.visualizer import overlay_cam_on_feature, save_overlay
 from feature_extraction.extractor import FeatureExtractor

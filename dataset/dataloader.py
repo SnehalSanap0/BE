@@ -3,7 +3,7 @@
 Single responsibility: translate project configuration
 (``CONFIG.training.batch_size``/``num_workers``) plus a split name into a
 ready-to-iterate :class:`torch.utils.data.DataLoader`. Kept separate from
-:class:`datasets.deepfake_dataset.DeepfakeAudioDataset` so the dataset class
+:class:`dataset.deepfake_dataset.DeepfakeAudioDataset` so the dataset class
 stays a pure data-access object and all batching policy lives in one place.
 """
 
@@ -12,7 +12,7 @@ from __future__ import annotations
 from torch.utils.data import DataLoader
 
 from configs.config import CONFIG
-from datasets.deepfake_dataset import DeepfakeAudioDataset
+from dataset.deepfake_dataset import DeepfakeAudioDataset
 from utils.logger import get_logger
 from utils.metadata_manager import MetadataManager
 
