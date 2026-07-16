@@ -111,10 +111,7 @@ class FeatureExtractor:
         """
         try:
             audio, sample_rate = sf.read(str(input_path), dtype="float32", always_2d=False)
-
-            feature = self._extract_fn(audio, sample_rate)
-            feature = _resize_to_square(feature, self.image_size)
-            feature = _normalize(feature)
+            feature = self.extract_array(audio, sample_rate)
 
             output_path.parent.mkdir(parents=True, exist_ok=True)
             np.save(output_path, feature)
@@ -126,3 +123,22 @@ class FeatureExtractor:
         logger.info("Extracted %s features %s -> %s", self.feature_type, input_path.name, output_path)
 
         return ExtractionResult(success=True, output_path=output_path, feature_shape=feature.shape)
+
+    def extract_array(self, audio: np.ndarray, sample_rate: int) -> np.ndarray:
+        """Extract, resize and normalize features from an in-memory waveform.
+
+        Factored out of :meth:`extract_file` so single-inference callers
+        (Grad-CAM explanation, the Flask inference endpoint) can reuse the
+        exact same feature computation without a round trip through disk.
+
+        Args:
+            audio: 1-D mono waveform, already preprocessed (fixed length,
+                target sample rate).
+            sample_rate: Sample rate of ``audio``, in Hz.
+
+        Returns:
+            2-D array of shape ``(image_size, image_size)``, z-score normalized.
+        """
+        feature = self._extract_fn(audio, sample_rate)
+        feature = _resize_to_square(feature, self.image_size)
+        return _normalize(feature)
