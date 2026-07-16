@@ -27,22 +27,57 @@ HF_TOKEN=hf_...
 
 ## Running the pipeline
 
+Every command below is safe to interrupt (Ctrl+C) and rerun — each stage reads `data/metadata/metadata.csv` to figure out what's already done and only processes what's left.
+
 ```powershell
-# 1. Stream a bounded sample of real + fake Hindi clips into data/raw/
+# 1. Stream a bounded sample of real (Kathbath) + fake (IndicSynth) Hindi
+#    clips into data/raw/hindi/{real,fake}/. Size is set by
+#    ingestion.samples_per_class in configs/config.yaml (default: 3000/class).
 python -m preprocessing.hf_ingestion
 
-# 2. Validate, transform (mono/16kHz/trim/normalize/pad-to-4s), save to data/processed/
+# 2. Validate, transform (mono / 16kHz / trim silence / peak normalize /
+#    pad-or-truncate to 4s), save to data/processed/. Updates metadata.csv.
 python -m preprocessing.pipeline
 
-# 3. Extract Mel/MFCC/LFCC features, resize, save to data/features/
+# 3. Extract Mel-spectrogram / MFCC / LFCC features (feature type set by
+#    features.type in config.yaml), resize to 224x224, save as .npy to
+#    data/features/. Updates metadata.csv.
 python -m feature_extraction.pipeline
 
-# 4. Assign stratified train/val/test splits
+# 4. Assign stratified train/val/test splits (ratios set by dataset.* in
+#    config.yaml), written into metadata.csv's "split" column.
 python -m dataset.split_assigner
+
+# 5. Train the configured model (baseline EfficientNet-B0, or
+#    EfficientNet-B0 + BiLSTM if model.use_bilstm is true). Resumable —
+#    reruns pick up from the last checkpoint. Writes
+#    checkpoints/last_checkpoint.pt and checkpoints/best_model.pt, plus
+#    TensorBoard logs under logs/tensorboard/.
+python -m training.train
+
+# 6. Evaluate the best checkpoint on the test split: accuracy, precision,
+#    recall, F1, ROC-AUC, EER, confusion matrix. Writes
+#    outputs/test_metrics.json and outputs/confusion_matrix.png.
+python -m evaluation.evaluate
+
+# 7. Explain a single clip's prediction with a Grad-CAM heatmap overlaid
+#    on its spectrogram. Writes outputs/explanations/<clip>_gradcam.png.
+python -m explainability.explain --audio path\to\clip.wav
+
+# 8. Serve predictions over HTTP. GET /health; POST /predict with a
+#    multipart "audio" field returns {predicted_label, confidence,
+#    gradcam_image_base64}.
+python -m deployment.app
 ```
 
-Every command above is safe to interrupt and rerun. Adjust `ingestion.samples_per_class` in `configs/config.yaml` to scale the dataset up, then rerun step 1 onward — only new clips are fetched/processed.
+To scale the dataset up, bump `ingestion.samples_per_class` in `configs/config.yaml` and rerun from step 1 — only the newly-needed clips are fetched and processed, nothing already done is repeated.
+
+Watch TensorBoard during/after training with:
+
+```powershell
+tensorboard --logdir logs/tensorboard
+```
 
 ## Configuration
 
-All tunables (audio params, feature extraction, model architecture, training hyperparameters, evaluation metrics, deployment) live in `configs/config.yaml`. See that file for the full set of options.
+All tunables (audio params, feature extraction, model architecture, training hyperparameters, evaluation metrics, explainability, deployment) live in `configs/config.yaml`, loaded once into the typed `CONFIG` singleton in `configs/config.py`. See that file for the full set of options.
