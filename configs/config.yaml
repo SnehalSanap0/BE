@@ -1,0 +1,117 @@
+# =============================================================================
+# Deepfake Audio Detector — Master Configuration
+# =============================================================================
+# This file is the single source of truth for every tunable value in the
+# project. Nothing in the codebase should hardcode a path, a sample rate, a
+# model hyperparameter, etc. — it should be read from here via configs/config.py.
+# =============================================================================
+
+paths:
+  # All paths are relative to the project root and are resolved with pathlib
+  # at load time (see configs/config.py). Nothing here is an absolute path.
+  data_dir: "data"
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  feature_dir: "data/features"
+  metadata_dir: "data/metadata"
+  metadata_file: "data/metadata/metadata.csv"
+  log_dir: "logs"
+  checkpoint_dir: "checkpoints"
+  output_dir: "outputs"
+  explanation_dir: "outputs/explanations"
+
+audio:
+  sample_rate: 16000
+  mono: true
+  target_duration_seconds: 4
+  remove_silence: true
+  top_db: 30
+  normalize: true
+  pad_mode: "constant"
+  supported_formats: [".wav", ".flac", ".mp3", ".ogg"]
+
+dataset:
+  languages: ["hindi"]
+  labels: ["real", "fake"]
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+  random_seed: 42
+
+# Bounded streaming ingestion from HuggingFace source datasets. Pulls at most
+# `samples_per_class` clips per label directly into data/raw/<language>/<label>/
+# without ever downloading the full upstream dataset (which is ~1TB combined).
+ingestion:
+  language: "hindi"
+  samples_per_class: 3000
+  hf_token_env_var: "HF_TOKEN"
+  real:
+    dataset: "ai4bharat/Kathbath"
+    config_name: "hindi"
+    split: "valid"
+    label: "real"
+    audio_field: "audio_filepath"
+  fake:
+    dataset: "vdivyasharma/IndicSynth"
+    config_name: "Hindi"
+    split: "train"
+    label: "fake"
+    audio_field: "audio"
+
+features:
+  type: "mel_spectrogram"   # one of: mel_spectrogram, mfcc, lfcc
+  n_mels: 128
+  n_mfcc: 40
+  n_lfcc: 40
+  n_fft: 1024
+  hop_length: 512
+  win_length: 1024
+  fmin: 0
+  fmax: 8000
+  power: 2.0
+  log_scale: true
+  image_size: 224   # spatial size features are resized to before EfficientNet
+
+model:
+  backbone: "efficientnet_b0"
+  pretrained: true
+  num_classes: 2
+  use_bilstm: true
+  lstm_hidden_size: 256
+  lstm_num_layers: 2
+  lstm_bidirectional: true
+  dropout: 0.3
+  freeze_backbone: false
+
+training:
+  batch_size: 32
+  num_epochs: 50
+  learning_rate: 0.0003
+  weight_decay: 0.00001
+  optimizer: "adamw"
+  scheduler: "cosine"
+  early_stopping_patience: 7
+  early_stopping_min_delta: 0.0001
+  mixed_precision: true
+  gradient_clip_norm: 5.0
+  num_workers: 4
+  checkpoint_metric: "val_f1"
+  resume: true
+
+evaluation:
+  metrics: ["accuracy", "precision", "recall", "f1", "roc_auc", "eer", "confusion_matrix"]
+  threshold: 0.5
+
+explainability:
+  method: "gradcam"
+  target_layer: "backbone.conv_head"
+  overlay_alpha: 0.5
+  colormap: "jet"
+
+deployment:
+  host: "0.0.0.0"
+  port: 5000
+  debug: false
+  max_upload_size_mb: 25
+  allowed_extensions: [".wav"]
+  model_checkpoint: "checkpoints/best_model.pt"
