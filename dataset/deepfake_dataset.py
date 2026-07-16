@@ -63,7 +63,7 @@ class DeepfakeAudioDataset(Dataset):
             raise ValueError(
                 f"No feature-extracted records found for split '{split}'. "
                 "Run preprocessing.pipeline, feature_extraction.pipeline and "
-                "datasets.split_assigner before constructing this dataset."
+                "dataset.split_assigner before constructing this dataset."
             )
 
         logger.info("Loaded %d record(s) for split '%s'.", len(self._records), split)

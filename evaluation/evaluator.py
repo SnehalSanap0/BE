@@ -16,7 +16,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from datasets.deepfake_dataset import INDEX_TO_LABEL
+from dataset.deepfake_dataset import INDEX_TO_LABEL
 from evaluation.metrics import compute_metrics
 from utils.logger import get_logger
 

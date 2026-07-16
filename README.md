@@ -38,7 +38,7 @@ python -m preprocessing.pipeline
 python -m feature_extraction.pipeline
 
 # 4. Assign stratified train/val/test splits
-python -m datasets.split_assigner
+python -m dataset.split_assigner
 ```
 
 Every command above is safe to interrupt and rerun. Adjust `ingestion.samples_per_class` in `configs/config.yaml` to scale the dataset up, then rerun step 1 onward — only new clips are fetched/processed.
