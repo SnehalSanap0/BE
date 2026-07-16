@@ -1,0 +1,65 @@
+# ==========================
+# Core Scientific Libraries
+# ==========================
+numpy>=2.0.0
+scipy>=1.13.0
+pandas>=2.2.0
+
+# ==========================
+# Deep Learning
+# ==========================
+torch>=2.3.0
+torchaudio>=2.3.0
+torchvision>=0.18.0
+timm>=1.0.7
+
+# ==========================
+# Audio Processing
+# ==========================
+librosa>=0.10.2
+soundfile>=0.12.1
+audioread>=3.0.1
+
+# ==========================
+# Computer Vision / Explainability
+# ==========================
+opencv-python>=4.10.0
+grad-cam>=1.5.0
+
+# ==========================
+# Dataset Handling
+# ==========================
+datasets>=2.20.0
+huggingface_hub>=0.24.0
+
+# ==========================
+# Machine Learning Utilities
+# ==========================
+scikit-learn>=1.5.0
+
+# ==========================
+# Configuration
+# ==========================
+PyYAML>=6.0.1
+python-dotenv>=1.0.1
+
+# ==========================
+# Progress & Utilities
+# ==========================
+tqdm>=4.66.0
+
+# ==========================
+# Visualization
+# ==========================
+matplotlib>=3.9.0
+
+# ==========================
+# Experiment Tracking
+# ==========================
+tensorboard>=2.17.0
+
+# ==========================
+# Deployment
+# ==========================
+flask>=3.0.3
+werkzeug>=3.0.3
