@@ -1,0 +1,109 @@
+# Research Log
+
+Running, crisp record of design decisions, bugs found, and experiment results — kept for writing up the methodology/results sections later. Newest entries at the bottom. Each entry: what we did, why, what we found.
+
+---
+
+### 2026-07-20 — Multi-source ingestion design
+Switched ingestion from one dataset per class to **multiple independent sources per class**:
+- `real`: Kathbath (3000) + Common Voice Hindi male (750) + Common Voice Hindi female (750)
+- `fake`: IndicSynth (3000) + SEA-Spoof, filtered to `language=hi, label=spoof` (1500)
+
+**Why:** a single dataset per label confounds "real vs fake" with "which dataset," letting a detector learn dataset/recording fingerprints instead of genuine spoofing artifacts, rather than the intended task.
+
+---
+
+### 2026-07-23 — Data audit: real-class shortfall
+Raw file counts on disk vs configured targets:
+
+| source_tag | target | actual |
+|---|---|---|
+| real (Kathbath) | 3000 | 3000 |
+| real_cv_m (CV male) | 750 | 750 |
+| real_cv_f (CV female) | 750 | **560** |
+| fake (IndicSynth) | 3000 | 3000 |
+| fake_sea (SEA-Spoof) | 1500 | 1500 |
+
+**Finding:** `real_cv_f` under-filled by 190 clips — the streamed HF split for that source simply doesn't contain 750 Hindi female clips; `ingest_source` has no warning for under-fill, it just stops when the stream is exhausted. Net effect: real=4310, fake=4500 (not perfectly balanced).
+
+---
+
+### 2026-07-23 — Pipeline staleness bug: metadata not rebuilt after adding sources
+`metadata.csv` still held only 6000 records (the old single-source-per-class ingestion) days after the new multi-source ingestion (8810 raw clips) had already been streamed to disk — `preprocessing.pipeline` / `feature_extraction.pipeline` / `dataset.split_assigner` had not been rerun. **The first two training runs on 2026-07-23 (BiLSTM and baseline) were both trained on the stale 6000-record dataset, not the new one.** Fixed by rerunning steps 2–4 of the pipeline (8810 records after rebuild, 2810 newly processed/featured).
+
+**Side note:** the two runs also overwrote each other's checkpoint files (`last_checkpoint.pt`/`best_model.pt` are architecture-agnostic filenames) since `training.resume=true` — a BiLSTM checkpoint and a baseline checkpoint can silently clobber one another if `model.use_bilstm` changes between runs without clearing `checkpoints/`.
+
+---
+
+### 2026-07-23 — First training run (post-rebuild), pooled random split
+Config: EfficientNet-B0 baseline (no BiLSTM), full 8810-clip multi-source dataset, standard `dataset.split_assigner` (stratified by label only, split randomly across pooled sources).
+
+**Result:** `accuracy=1.0000, f1=1.0000, roc_auc=1.0000, eer=0.0000` — by epoch 1, early-stopped at epoch 8/50.
+
+**Read:** suspiciously perfect — real anti-spoofing benchmarks don't hit exact 0 EER. Hypothesis: multiple sources per class stops the model keying on *which dataset*, but not on *recording-condition/channel artifacts shared within a class* (e.g. natural mic recordings vs. vocoder output). Random pooled splitting also puts every source in train AND test, so even a channel-fingerprint shortcut looks perfect.
+
+---
+
+### 2026-07-23 — Confound smoke test: trailing-silence / RMS / silence-ratio by label
+Script: `scripts/confound_check.py` (scratch, one-off). Computed per-clip trailing zero-padding ratio, RMS loudness, and frame-level silence ratio from the already-processed audio, grouped by label and source_tag.
+
+**Finding:** no single feature is *perfectly* separable (ranges overlap), so it's not a trivial one-feature leak. But there's a strong systematic shift: real clips average ~3x more trailing silence/padding than fake (real 0.116 vs fake 0.040 trailing-zero ratio; 0.26 vs 0.14 silence ratio), consistent across sub-sources (Common Voice sources pad 26–34%, TTS sources pad 2–8%). Natural speech has more pauses/breath than TTS output — plausible partial shortcut on top of other channel-level cues a CNN can see that this script can't measure directly.
+
+---
+
+### 2026-07-23 — Cross-source holdout generalization test
+Script: `scripts/cross_source_holdout_check.py`. Re-split by **source dataset**, not randomly:
+- train/val: only `real` (Kathbath) + `fake` (IndicSynth) — model never sees the other two sources during training or validation
+- test: only `real_cv_m`/`real_cv_f` (Common Voice) + `fake_sea` (SEA-Spoof) — recording chains and synthesis systems never seen in training
+
+Reuses existing `MetadataManager`/`build_model`/`build_dataloader`/`Trainer`/`Evaluator`; writes to a separate metadata file (`metadata_cross_source_holdout.csv`) and checkpoint dir (`checkpoints/cross_source_holdout/`) so the main pipeline/checkpoints are untouched.
+
+**Result:** `accuracy=0.9612, precision=0.9741, recall=0.9527, f1=0.9633, roc_auc=0.9939, eer=0.0374`. Confusion matrix: 71/1500 actual spoof clips misclassified as real (4.73% miss rate), 38/1310 actual real clips misclassified as fake (2.90% false-alarm rate).
+
+**Interpretation:**
+- EER 0.0000 → 0.0374 on completely unseen sources confirms the pooled-split "perfect" score was partly inflated by a channel/recording-condition shortcut, not solely genuine spoof-detection.
+- But 96%+ accuracy / ~3.7% EER on entirely unseen recording chains is a legitimately solid cross-corpus result (in line with published cross-dataset anti-spoofing numbers) — so the model did learn some real, transferable signal on top of the shortcut, not nothing.
+- Operationally, the miss rate (spoof passed as real) exceeds the false-alarm rate — the asymmetry to consider when picking a decision threshold for a security-relevant deployment, rather than using the EER-equalizing threshold (0.443) by default.
+- **Methodological takeaway for the paper:** report cross-source (leave-one-source-out) generalization as the primary metric, not the pooled random-split metric — the latter is an optimistic upper bound, not a realistic estimate.
+
+**Open question:** only one train/test source pairing has been tested so far. Rotating which sources are held out (e.g. train on Common Voice+SEA-Spoof, test on Kathbath+IndicSynth) would show whether ~3-4% EER is a stable estimate or specific to this particular source pairing.
+
+---
+
+### 2026-07-24 — Cross-source holdout, reversed pairing ("swapped" rotation)
+Script generalized (`scripts/cross_source_holdout_check.py --rotation {original,swapped}`) to test the reverse direction of the prior experiment: train/val on Common Voice (`real_cv_m`/`real_cv_f`) + SEA-Spoof (`fake_sea`), test on Kathbath (`real`) + IndicSynth (`fake`) — the mirror image of the "original" rotation.
+
+**Result:** `accuracy=0.5027, precision=0.9444, recall=0.0057, f1=0.0113, roc_auc=0.8761, eer=0.2160, eer_threshold=0.00227`. Confusion matrix: 2983/3000 actual IndicSynth spoof clips misclassified as real (99.4% miss rate) at the standard 0.5 threshold; only 1/3000 Kathbath real clips misclassified as fake.
+
+**Interpretation:**
+- At the default decision threshold, this direction collapses to near-chance (50.3% accuracy) — far worse than the "original" rotation's 96.1%. The model predicts almost everything as "real," missing nearly all spoofed clips.
+- Not pure failure to learn, though: `roc_auc=0.876` shows real ranking signal survives; the near-zero `eer_threshold` reveals a **calibration collapse under domain shift** — the model's fake-probability output is compressed toward zero for this entire unseen domain (both classes), not just for the hard cases. Recalibrating to the domain-specific EER threshold recovers to 21.6% EER — still much worse than the 3.74% seen in the other direction, but a different (and less alarming) failure mode than "zero signal."
+- **Generalization here is asymmetric, not a fixed property of the model.** Training on {Kathbath, IndicSynth} → testing on {Common Voice, SEA-Spoof} generalized well (3.74% EER). Training on {Common Voice, SEA-Spoof} (the larger, more synthesis-diverse fake source) → testing on {Kathbath, IndicSynth} generalized far worse. More training-source diversity did not translate to better transfer in this direction — source *composition*, not just diversity/size, drives the result.
+- **Methodological takeaway for the paper:** (1) the earlier 3.74% EER must be reported as direction-specific, not "the model generalizes cross-corpus" in general — this result disproves that broader claim; (2) a fixed 0.5 decision threshold is unsafe across domains — a system tuned this way could silently pass ~99% of spoofed audio if deployed against a domain resembling Kathbath/IndicSynth without per-domain threshold recalibration; (3) worth reporting AUC alongside EER/accuracy specifically because AUC survived here while threshold-dependent metrics collapsed — a case where discriminative power and calibration diverge sharply.
+
+**Open question:** whether this asymmetry is driven by IndicSynth being a single-TTS-system fake source (narrow spoof-artifact diversity) versus SEA-Spoof spanning many systems, by Kathbath vs. Common Voice's differing channel/noise characteristics, or by both — worth an ablation (e.g. swap only the fake source or only the real source between rotations) if pursued further.
+
+---
+
+### 2026-07-24 — Full 2x2 factorial: isolating which source drives the asymmetry
+Added `real_swap_only` and `fake_swap_only` rotations to `scripts/cross_source_holdout_check.py`, completing a full 2x2 factorial over (real-source, fake-source) used for training — the project has exactly two of each (real: Kathbath (A) vs Common Voice (B); fake: IndicSynth (A) vs SEA-Spoof (B)), each rotation trains on one (real, fake) combination and tests on the complementary pair.
+
+**Full result table** (EER / ROC-AUC on the held-out complementary pair):
+
+| train real ↓ / fake → | IndicSynth (A) | SEA-Spoof (B) |
+|---|---|---|
+| **Kathbath (A)** | `original`: EER=0.0374, AUC=0.9939 | `fake_swap_only`: EER=0.4046, AUC=0.6273 |
+| **Common Voice (B)** | `real_swap_only`: EER=0.2325, AUC=0.8165 | `swapped`: EER=0.2160, AUC=0.8761 |
+
+`real_swap_only` (train real=Common Voice + fake=IndicSynth, test real=Kathbath + fake=SEA-Spoof): `accuracy=0.6711, precision=0.5388, recall=0.0927, f1=0.1581, roc_auc=0.8165, eer=0.2325`. `fake_swap_only` (train real=Kathbath + fake=SEA-Spoof, test real=Common Voice + fake=IndicSynth): `accuracy=0.4211, precision=0.7695, recall=0.2403, f1=0.3663, roc_auc=0.6273, eer=0.4046`.
+
+**Interpretation — this is an interaction effect, not a main effect of either source alone:**
+- Neither "the fake-source choice dominates" nor "the real-source choice dominates" holds in isolation. If it did, one row or one column of the table would be consistently better; instead the effect of swapping the fake source **depends on which real-source it's paired with**.
+- Along the Kathbath row: swapping only the fake source (IndicSynth→SEA-Spoof) is catastrophic — EER 0.0374→0.4046, and AUC collapses from near-perfect (0.9939) to barely-above-chance (0.6273). This is not a threshold/calibration issue like the other three cells — the model's actual score ranking breaks down.
+- Along the Common Voice row, the identical fake-source swap barely moves the result (EER 0.2325 vs 0.2160, AUC 0.8165 vs 0.8761) — essentially flat.
+- **(Kathbath, IndicSynth) is a uniquely well-generalizing training pairing; (Kathbath, SEA-Spoof) is uniquely the worst** — same real source, opposite outcomes, purely a function of which fake corpus it's trained alongside.
+- The other three cells (`swapped`, `real_swap_only`, and to a lesser extent `fake_swap_only`) share the same near-zero `eer_threshold` signature seen in the earlier "swapped" entry — a calibration collapse under domain shift, where AUC partly survives (0.82–0.88) but the fixed decision threshold does not. `fake_swap_only` is qualitatively different: its AUC (0.6273) shows the *ranking itself*, not just the threshold, has broken down — the one training combination that fails to learn a transferable representation at all.
+
+**Methodological takeaway for the paper:** don't report cross-source generalization as a single number or even as "asymmetric between two directions" — it is a genuine interaction between which real corpus and which fake corpus the model is trained on, and the single best-generalizing setup in this whole study (`original`, EER 3.74%) is adjacent in the table to the single worst (`fake_swap_only`, EER 40.46%), differing by only one factor. This argues for reporting the full factorial (or at least flagging that source-pairing interactions exist) rather than a single train/test split, cross-source or otherwise, as evidence of generalization.
+
+**Open question, still unresolved:** *why* Kathbath+IndicSynth specifically produces a well-calibrated, transferable decision boundary while Kathbath+SEA-Spoof produces the least transferable one is not yet explained — candidates worth checking: SEA-Spoof's much larger size/class-imbalance effects during training, its multilingual composition (it's filtered to `hi` for ingestion, but the model may still be seeing residual variation the filter doesn't fully control for), or some interaction between Kathbath's noisier/broadcast channel and SEA-Spoof's spoof-artifact distribution specifically. Not yet tested.
