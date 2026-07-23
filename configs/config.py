@@ -106,30 +106,48 @@ class DatasetConfig:
 
 @dataclass(frozen=True)
 class HFSourceConfig:
-    """A single HuggingFace source dataset to stream one label's clips from."""
+    """A single HuggingFace source dataset to stream one label's clips from.
+
+    A label (``real``/``fake``) can be backed by more than one source (see
+    :class:`IngestionConfig`), so each source carries its own ``target_count``
+    and a ``source_tag`` used as a filename prefix — this keeps sources
+    independently resumable and prevents filename collisions when multiple
+    sources write into the same ``data/raw/<language>/<label>/`` directory.
+
+    ``filters`` handles sources that are not pre-split by language/label
+    (e.g. a single multilingual dataset covering many languages and both
+    real/fake in one stream): each ``(column, required_value)`` pair is
+    checked against every streamed example, and only exact matches are kept.
+    Leave empty for sources that are already pure (one language, one label).
+    """
 
     dataset: str
-    config_name: str
+    config_name: str | None
     split: str
     label: str
     audio_field: str
+    target_count: int
+    source_tag: str
+    filters: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
 class IngestionConfig:
     """Bounded streaming-ingestion parameters for pulling raw clips from HuggingFace.
 
-    This exists so the project never needs to download the full ~1TB of
-    upstream IndicSUPERB/IndicSynth data — it streams at most
-    ``samples_per_class`` examples per label straight into
-    ``data/raw/<language>/<label>/``.
+    This exists so the project never needs to download the full upstream
+    datasets — each source in ``real``/``fake`` streams at most its own
+    ``target_count`` examples straight into ``data/raw/<language>/<label>/``.
+    Multiple sources per label are supported deliberately: relying on a
+    single source per label means ``real`` and ``fake`` are perfectly
+    confounded with "which dataset," letting a detector learn to recognize
+    recording/dataset signatures instead of genuine spoofing artifacts.
     """
 
     language: str
-    samples_per_class: int
     hf_token_env_var: str
-    real: HFSourceConfig
-    fake: HFSourceConfig
+    real: tuple[HFSourceConfig, ...]
+    fake: tuple[HFSourceConfig, ...]
 
 
 @dataclass(frozen=True)
@@ -308,18 +326,23 @@ def load_config(config_path: Path | None = None) -> Config:
     def _hf_source(source_raw: dict[str, Any]) -> HFSourceConfig:
         return HFSourceConfig(
             dataset=source_raw["dataset"],
-            config_name=source_raw["config_name"],
+            config_name=source_raw.get("config_name"),
             split=source_raw["split"],
             label=source_raw["label"],
             audio_field=source_raw["audio_field"],
+            target_count=source_raw["target_count"],
+            source_tag=source_raw["source_tag"],
+            filters=tuple((f["field"], f["value"]) for f in source_raw.get("filters", [])),
         )
+
+    def _hf_source_list(sources_raw: list[dict[str, Any]]) -> tuple[HFSourceConfig, ...]:
+        return tuple(_hf_source(source_raw) for source_raw in sources_raw)
 
     ingestion = IngestionConfig(
         language=ingestion_raw["language"],
-        samples_per_class=ingestion_raw["samples_per_class"],
         hf_token_env_var=ingestion_raw["hf_token_env_var"],
-        real=_hf_source(ingestion_raw["real"]),
-        fake=_hf_source(ingestion_raw["fake"]),
+        real=_hf_source_list(ingestion_raw["real"]),
+        fake=_hf_source_list(ingestion_raw["fake"]),
     )
 
     features_raw = raw["features"]

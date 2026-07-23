@@ -1,14 +1,12 @@
 """Bounded streaming ingestion of raw audio from HuggingFace source datasets.
 
 Design rationale:
-    The upstream sources for this project — ``ai4bharat/Kathbath`` (real
-    Hindi speech, ~174GB) and ``vdivyasharma/IndicSynth`` (synthetic Hindi
-    speech, part of an 845GB multilingual set) — are far too large to
-    download in full for a research project. This module streams examples
-    from each source over HTTP via the HuggingFace ``datasets`` library
+    The upstream sources for this project are far too large to download in
+    full for a research project. This module streams examples from each
+    configured source over HTTP via the HuggingFace ``datasets`` library
     (``streaming=True``, so nothing beyond the current example is buffered),
-    writes at most ``CONFIG.ingestion.samples_per_class`` raw clips per label
-    to ``data/raw/<language>/<label>/``, and stops. It performs no audio
+    writes at most that source's ``target_count`` raw clips to
+    ``data/raw/<language>/<label>/``, and stops. It performs no audio
     decoding or transformation of its own — clips are written byte-for-byte
     in their original container format, and the existing
     :mod:`preprocessing.metadata_builder` / :mod:`preprocessing.pipeline`
@@ -16,14 +14,27 @@ Design rationale:
     local. This module is the *only* one in the project allowed to make
     network calls to fetch dataset content.
 
+    Each label (``real``/``fake``) is backed by *multiple* sources
+    (``CONFIG.ingestion.real`` / ``.fake``), deliberately: a single source
+    per label means "real vs fake" is perfectly confounded with "which
+    dataset," so a detector can score well by recognizing recording/dataset
+    fingerprints rather than genuine spoofing artifacts. Current sources:
+      - real: ``ai4bharat/Kathbath`` + Common Voice Hindi (via a Parquet
+        mirror, since the official Mozilla repo uses a loading-script format
+        newer ``datasets`` versions no longer support)
+      - fake: ``vdivyasharma/IndicSynth`` + ``Jack-ppkdczgx/SEA-Spoof``
+        (filtered to Hindi), which spans multiple distinct TTS/VC systems
+        rather than just IndicSynth's, so the fake class isn't defined by
+        one synthesis technique's artifacts.
+
 Authentication:
-    ``ai4bharat/Kathbath`` is a gated dataset. Before running this module
-    you must (1) accept its terms at
-    https://huggingface.co/datasets/ai4bharat/Kathbath while logged into a
-    HuggingFace account, (2) create a read-scoped access token at
+    ``ai4bharat/Kathbath`` and ``Jack-ppkdczgx/SEA-Spoof`` are gated
+    datasets. Before running this module you must (1) accept each one's
+    terms/request access on huggingface.co while logged into a HuggingFace
+    account, (2) create a read-scoped access token at
     https://huggingface.co/settings/tokens, and (3) set it as the
     environment variable named by ``CONFIG.ingestion.hf_token_env_var``
-    (default ``HF_TOKEN``). ``vdivyasharma/IndicSynth`` requires no auth.
+    (default ``HF_TOKEN``). The other sources require no auth.
 """
 
 from __future__ import annotations
@@ -45,22 +56,26 @@ class DatasetAccessError(RuntimeError):
     """Raised when a source dataset cannot be accessed, typically due to auth."""
 
 
-def _existing_clip_count(destination_dir: Path) -> int:
-    """Count clips already ingested for a given language/label directory.
+def _existing_clip_count(destination_dir: Path, source_tag: str) -> int:
+    """Count clips already ingested by one specific source into a label directory.
 
-    Used to make ingestion resumable: if a previous run already wrote N
-    clips, this run only fetches enough additional clips to reach the
-    configured target instead of re-fetching from the start.
+    Used to make ingestion resumable per-source: multiple sources can share
+    the same ``destination_dir`` (e.g. two real sources both writing into
+    ``data/raw/hindi/real/``), so counting must be scoped to files this
+    source itself wrote — identified by its ``source_tag`` filename prefix —
+    not every file in the directory.
 
     Args:
         destination_dir: Directory clips for one language/label are written to.
+        source_tag: This source's filename prefix (``HFSourceConfig.source_tag``).
 
     Returns:
-        Number of files already present in ``destination_dir``.
+        Number of files already present in ``destination_dir`` belonging to this source.
     """
     if not destination_dir.exists():
         return 0
-    return sum(1 for entry in destination_dir.iterdir() if entry.is_file())
+    prefix = f"{source_tag}_"
+    return sum(1 for entry in destination_dir.iterdir() if entry.is_file() and entry.name.startswith(prefix))
 
 
 def _resolve_hf_token(token_env_var: str) -> str | None:
@@ -79,20 +94,32 @@ def _resolve_hf_token(token_env_var: str) -> str | None:
     return token
 
 
+def _matches_filters(example: dict, filters: tuple[tuple[str, str], ...]) -> bool:
+    """Check whether a streamed example satisfies every configured filter.
+
+    Args:
+        example: One row from a streamed HuggingFace dataset.
+        filters: ``(column, required_value)`` pairs. Empty means "no filtering."
+
+    Returns:
+        ``True`` if every filter's column equals its required value.
+    """
+    return all(str(example.get(field)) == value for field, value in filters)
+
+
 def ingest_source(
     source: HFSourceConfig,
     language: str,
-    target_count: int,
     raw_dir: Path,
     hf_token: str | None,
 ) -> dict[str, int]:
-    """Stream up to ``target_count`` clips from one HuggingFace source dataset.
+    """Stream up to ``source.target_count`` clips from one HuggingFace source dataset.
 
     Args:
-        source: Description of the dataset, config, split and label to pull.
+        source: Description of the dataset, config, split, label and target
+            count to pull. Multiple sources may target the same label/directory —
+            see :class:`configs.config.HFSourceConfig` for how that stays resumable.
         language: Language subdirectory to write clips under.
-        target_count: Maximum number of clips to have on disk for this label
-            after this call returns (existing clips count toward the total).
         raw_dir: Root raw-data directory (``CONFIG.paths.raw_dir``).
         hf_token: HuggingFace access token, or ``None`` for ungated datasets.
 
@@ -106,25 +133,27 @@ def ingest_source(
     destination_dir = raw_dir / language / source.label
     destination_dir.mkdir(parents=True, exist_ok=True)
 
-    already_present = _existing_clip_count(destination_dir)
-    remaining = max(0, target_count - already_present)
+    already_present = _existing_clip_count(destination_dir, source.source_tag)
+    remaining = max(0, source.target_count - already_present)
 
     if remaining == 0:
         logger.info(
-            "Skipping %s/%s: already have %d/%d clips.",
+            "Skipping %s (%s/%s): already have %d/%d clips.",
+            source.source_tag,
             language,
             source.label,
             already_present,
-            target_count,
+            source.target_count,
         )
         return {"already_present": already_present, "newly_written": 0, "skipped": 0}
 
     logger.info(
-        "Streaming %s (%s/%s) for label '%s': need %d more clip(s).",
+        "Streaming %s (%s/%s) for label '%s' [%s]: need %d more clip(s).",
         source.dataset,
         source.config_name,
         source.split,
         source.label,
+        source.source_tag,
         remaining,
     )
 
@@ -148,11 +177,14 @@ def ingest_source(
     newly_written = 0
     skipped = 0
 
-    progress = tqdm(total=remaining, desc=f"{language}/{source.label}")
+    progress = tqdm(total=remaining, desc=f"{language}/{source.label}/{source.source_tag}")
 
     for example in dataset:
         if newly_written >= remaining:
             break
+
+        if source.filters and not _matches_filters(example, source.filters):
+            continue
 
         audio_entry = example.get(source.audio_field)
         if not audio_entry or not audio_entry.get("bytes"):
@@ -162,7 +194,7 @@ def ingest_source(
         source_name = audio_entry.get("path") or f"clip_{already_present + newly_written}.wav"
         extension = Path(source_name).suffix or ".wav"
 
-        clip_id = f"{source.label}_{already_present + newly_written:06d}{extension}"
+        clip_id = f"{source.source_tag}_{already_present + newly_written:06d}{extension}"
         output_path = destination_dir / clip_id
 
         try:
@@ -178,7 +210,8 @@ def ingest_source(
     progress.close()
 
     logger.info(
-        "Finished %s/%s: %d already present, %d newly written, %d skipped.",
+        "Finished %s (%s/%s): %d already present, %d newly written, %d skipped.",
+        source.source_tag,
         language,
         source.label,
         already_present,
@@ -189,19 +222,18 @@ def ingest_source(
 
 
 def ingest_all() -> dict[str, dict[str, int]]:
-    """Ingest both the real and fake source datasets per ``CONFIG.ingestion``.
+    """Ingest every real and fake source dataset per ``CONFIG.ingestion``.
 
     Returns:
-        Mapping of label -> summary dict, as returned by :func:`ingest_source`.
+        Mapping of ``source_tag`` -> summary dict, as returned by :func:`ingest_source`.
     """
     hf_token = _resolve_hf_token(CONFIG.ingestion.hf_token_env_var)
 
     results: dict[str, dict[str, int]] = {}
-    for source in (CONFIG.ingestion.real, CONFIG.ingestion.fake):
-        results[source.label] = ingest_source(
+    for source in (*CONFIG.ingestion.real, *CONFIG.ingestion.fake):
+        results[source.source_tag] = ingest_source(
             source=source,
             language=CONFIG.ingestion.language,
-            target_count=CONFIG.ingestion.samples_per_class,
             raw_dir=CONFIG.paths.raw_dir,
             hf_token=hf_token,
         )

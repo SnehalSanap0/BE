@@ -39,24 +39,61 @@ dataset:
   random_seed: 42
 
 # Bounded streaming ingestion from HuggingFace source datasets. Pulls at most
-# `samples_per_class` clips per label directly into data/raw/<language>/<label>/
-# without ever downloading the full upstream dataset (which is ~1TB combined).
+# Each source below streams up to its own `target_count` clips directly into
+# data/raw/<language>/<label>/ without ever downloading the full upstream
+# dataset. A label can have more than one source deliberately: relying on a
+# single dataset per label means "real vs fake" is confounded with "which
+# dataset," letting a model learn dataset/recording fingerprints instead of
+# genuine spoofing artifacts. `source_tag` prefixes each source's filenames
+# so multiple sources sharing one label/directory stay independently
+# resumable and never collide. `filters` (optional) is for sources that
+# aren't pre-split by language/label — each streamed example must match
+# every (field, value) pair to be kept.
 ingestion:
   language: "hindi"
-  samples_per_class: 3000
   hf_token_env_var: "HF_TOKEN"
   real:
-    dataset: "ai4bharat/Kathbath"
-    config_name: "hindi"
-    split: "valid"
-    label: "real"
-    audio_field: "audio_filepath"
+    - dataset: "ai4bharat/Kathbath"
+      config_name: "hindi"
+      split: "valid"
+      label: "real"
+      audio_field: "audio_filepath"
+      target_count: 3000
+      source_tag: "real"
+    - dataset: "SayantanJoker/Common_voice_hindi_denoised_male"
+      config_name: null
+      split: "train"
+      label: "real"
+      audio_field: "audio"
+      target_count: 750
+      source_tag: "real_cv_m"
+    - dataset: "SayantanJoker/Common_voice_hindi_denoised_female"
+      config_name: null
+      split: "train"
+      label: "real"
+      audio_field: "audio"
+      target_count: 750
+      source_tag: "real_cv_f"
   fake:
-    dataset: "vdivyasharma/IndicSynth"
-    config_name: "Hindi"
-    split: "train"
-    label: "fake"
-    audio_field: "audio"
+    - dataset: "vdivyasharma/IndicSynth"
+      config_name: "Hindi"
+      split: "train"
+      label: "fake"
+      audio_field: "audio"
+      target_count: 3000
+      source_tag: "fake"
+    - dataset: "Jack-ppkdczgx/SEA-Spoof"
+      config_name: null
+      split: "train"
+      label: "fake"
+      audio_field: "audio"
+      target_count: 1500
+      source_tag: "fake_sea"
+      filters:
+        - field: "language"
+          value: "hi"
+        - field: "label"
+          value: "spoof"
 
 features:
   type: "mel_spectrogram"   # one of: mel_spectrogram, mfcc, lfcc
@@ -76,7 +113,7 @@ model:
   backbone: "efficientnet_b0"
   pretrained: true
   num_classes: 2
-  use_bilstm: true
+  use_bilstm: false
   lstm_hidden_size: 256
   lstm_num_layers: 2
   lstm_bidirectional: true
