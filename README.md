@@ -2,6 +2,8 @@
 
 Binary classification of audio clips as **real human speech** or **AI-generated / synthetic speech**, built on EfficientNet-B0 (+ optional BiLSTM temporal head) over mel-spectrogram / MFCC / LFCC features. Initial focus: Hindi, drawing real speech from [Kathbath](https://huggingface.co/datasets/ai4bharat/Kathbath) and Common Voice Hindi, and synthetic speech from [IndicSynth](https://huggingface.co/datasets/vdivyasharma/IndicSynth) and [SEA-Spoof](https://huggingface.co/datasets/Jack-ppkdczgx/SEA-Spoof) — multiple sources per class deliberately, so "real vs fake" isn't confounded with "which dataset."
 
+New to a term used in this README or in the code (EER, mel-spectrogram, shortcut learning, Grad-CAM, ...)? See **[docs/CONCEPTS_INDEX.md](docs/CONCEPTS_INDEX.md)** — plain-language explanations, one file per folder, written for understanding and defense (viva/cross-questions), not dictionary definitions.
+
 ## Design principles
 
 - **`metadata.csv` is the single source of truth.** Every stage (preprocessing, feature extraction, dataset loading) reads and writes exactly this file. No stage scans a data folder to decide what to do, except the one-time bootstrap in `preprocessing/metadata_builder.py`.
@@ -68,6 +70,11 @@ python -m explainability.explain --audio path\to\clip.wav
 #    multipart "audio" field returns {predicted_label, confidence,
 #    gradcam_image_base64}.
 python -m deployment.app
+
+# 8b. Alternative: interactive Gradio demo (upload/record audio, see the
+#     prediction and Grad-CAM overlay in-browser). Wraps the same
+#     InferenceService as step 8, so predictions are identical.
+python -m deployment.gradio_app
 ```
 
 To scale the dataset up, bump any source's `target_count` (or add a new source) under `ingestion.real` / `ingestion.fake` in `configs/config.yaml` and rerun from step 1 — only the newly-needed clips are fetched and processed, nothing already done is repeated.
@@ -104,6 +111,28 @@ Each rotation reuses the already-processed/-featured clips (no preprocessing or 
 - `outputs/cross_source_holdout_<rotation>_metrics.json` — that rotation's held-out test metrics
 
 Pass `--rebuild-split` to recompute a rotation's split assignment (e.g. after ingesting more clips) instead of reusing the existing metadata copy. If test EER stays close to the pooled-split result, the model is learning genuine spoof-vs-real cues; if it jumps substantially, the pooled near-zero EER was a channel/source shortcut. See `docs/research_log.md` for results and interpretation as they come in.
+
+## Diagnosing *why* cross-source generalization varies
+
+Two scripts investigate the mechanism behind the factorial's source-pairing interaction (see `docs/research_log.md`), rather than just its existence:
+
+```powershell
+# Per-source signal-statistic audit: trailing-silence ratio, frame-level
+# silence ratio, RMS loudness, sampled per source_tag from processed audio,
+# plus clip-count/duration/speaker stats pulled directly from metadata.csv.
+# Writes outputs/confound_analysis/source_confound_summary.{csv,json}.
+python -m scripts.confound_check --sample-size 300
+
+# Embedding-space diagnostic: extracts each rotation checkpoint's 1280-d
+# pooled backbone embedding for a balanced cross-source sample, t-SNE-plots
+# it colored by source and by label, and reports silhouette(source) vs
+# silhouette(label) as a "shortcut_ratio" -- how much the model's learned
+# representation encodes recording source relative to the intended
+# real/fake task. Writes outputs/embedding_analysis/<rotation>_tsne.png
+# and <rotation>_silhouette.json.
+python -m scripts.embedding_analysis --rotation fake_swap_only
+python -m scripts.embedding_analysis --all   # all 4 rotations + the pooled-split model
+```
 
 ## Configuration
 

@@ -107,3 +107,49 @@ Added `real_swap_only` and `fake_swap_only` rotations to `scripts/cross_source_h
 **Methodological takeaway for the paper:** don't report cross-source generalization as a single number or even as "asymmetric between two directions" — it is a genuine interaction between which real corpus and which fake corpus the model is trained on, and the single best-generalizing setup in this whole study (`original`, EER 3.74%) is adjacent in the table to the single worst (`fake_swap_only`, EER 40.46%), differing by only one factor. This argues for reporting the full factorial (or at least flagging that source-pairing interactions exist) rather than a single train/test split, cross-source or otherwise, as evidence of generalization.
 
 **Open question, still unresolved:** *why* Kathbath+IndicSynth specifically produces a well-calibrated, transferable decision boundary while Kathbath+SEA-Spoof produces the least transferable one is not yet explained — candidates worth checking: SEA-Spoof's much larger size/class-imbalance effects during training, its multilingual composition (it's filtered to `hi` for ingestion, but the model may still be seeing residual variation the filter doesn't fully control for), or some interaction between Kathbath's noisier/broadcast channel and SEA-Spoof's spoof-artifact distribution specifically. Not yet tested.
+
+---
+
+### 2026-07-24 — Per-source confound audit (`scripts/confound_check.py`, rewritten)
+
+The original one-off confound script (never committed) found real clips carry ~3x more trailing silence/padding than fake clips on average. Rewrote it as `scripts/confound_check.py` to directly compare sources *within* each label — specifically IndicSynth (`fake`) vs SEA-Spoof (`fake_sea`) — since the factorial above showed the fake-source choice interacts with the real-source choice rather than acting as a fixed effect. Sampled 300 clips/source (all 5 sources), computing trailing-zero-padding ratio, frame-level silence ratio (`librosa.effects.split`, top_db=30), and RMS loudness from the already-processed audio; duration/sample_rate/clip-count pulled directly from `metadata.csv`.
+
+**Result** (mean ± std; full table in `outputs/confound_analysis/source_confound_summary.csv`):
+
+| source_tag | trailing_zero_mean | trailing_zero_std | silence_ratio_mean | silence_ratio_std | rms_mean |
+|---|---|---|---|---|---|
+| fake (IndicSynth) | 0.0144 | 0.0403 | 0.0689 | 0.0636 | 0.1518 |
+| fake_sea (SEA-Spoof) | 0.0779 | 0.1556 | 0.1120 | 0.1495 | 0.1622 |
+| real (Kathbath) | 0.0365 | 0.0832 | 0.1270 | 0.1003 | 0.1115 |
+| real_cv_f (Common Voice) | 0.2810 | 0.2582 | 0.3310 | 0.2452 | 0.1308 |
+| real_cv_m (Common Voice) | 0.3591 | 0.2525 | 0.3965 | 0.2252 | 0.1175 |
+
+**Interpretation:**
+- Confirms and sharpens the earlier scratch-script finding: Common Voice sources pad 28–36% on average vs. Kathbath's 3.65% and IndicSynth's 1.44% — the real-side channel confound is real and large.
+- **New finding, directly relevant to the open question:** SEA-Spoof carries **~5.4x more trailing silence** than IndicSynth (0.0779 vs 0.0144) and **~1.6x more frame-level silence** (0.1120 vs 0.0689) on average — a distinguishing channel-level signature on the fake side specifically, not just the previously-known real-side one.
+- SEA-Spoof's std on both silence metrics is **3–4x higher than IndicSynth's** (trailing-zero std 0.1556 vs 0.0403; silence-ratio std 0.1495 vs 0.0636) — i.e., SEA-Spoof clips are far more heterogeneous among themselves than IndicSynth clips are. This is consistent with the research log's standing hypothesis that SEA-Spoof spans many synthesis systems while IndicSynth is a single TTS system: a narrow, consistent fake-source (IndicSynth) pairs well with Kathbath (`original`, EER 3.74%), while a wide, heterogeneous one (SEA-Spoof) paired with the same real source (`fake_swap_only`) is the worst-generalizing cell in the factorial (EER 40.46%).
+- **Limitation found, not yet fixed:** `metadata.csv`'s `speaker` column reads back as exactly 1 distinct value for every source — it was never populated per-clip during ingestion (defaults to `"unknown"`), so it can't currently be used as an independent diversity proxy. If speaker-level diversity turns out to matter, `preprocessing/metadata_builder.py`'s ingestion path needs to actually record per-clip speaker IDs where the upstream dataset provides them (Kathbath and Common Voice both do).
+- **Methodological note for the paper:** report this table alongside the factorial as evidence for the *mechanism* behind the interaction effect, not just its existence.
+
+---
+
+### 2026-07-24 — Embedding-space diagnostic (`scripts/embedding_analysis.py`): source vs. label separability
+
+To test the shortcut-learning hypothesis directly rather than only via proxy signal statistics, extracted each rotation's trained backbone's pooled 1280-d embedding for a balanced sample (400 clips/source, all 5 sources, 2000 total) drawn from the *full* dataset — not just that rotation's own held-out split, so all five checkpoints are compared on the identical clip sample. Computed silhouette score of the embedding space against `source_tag` labels and against `real`/`fake` labels separately, plus a `shortcut_ratio = silhouette(source) / silhouette(label)` (higher = embedding space structured more by recording source than by the intended task). t-SNE plots colored both ways saved to `outputs/embedding_analysis/<rotation>_tsne.png`.
+
+**Result:**
+
+| rotation | silhouette(source) | silhouette(label) | shortcut_ratio | cross-source EER (from factorial) |
+|---|---|---|---|---|
+| main (pooled random split) | 0.1469 | 0.4608 | 0.319 | n/a (EER=0.0000, inflated — see 2026-07-23 entry) |
+| original | 0.1436 | 0.2810 | 0.511 | 0.0374 |
+| real_swap_only | 0.1492 | 0.2746 | 0.543 | 0.2325 |
+| swapped | 0.1417 | 0.2224 | 0.637 | 0.2160 |
+| fake_swap_only | 0.1691 | 0.1769 | **0.956** | **0.4046** |
+
+**Interpretation:**
+- The `shortcut_ratio` ordering tracks the cross-source EER ordering closely (`original` best on both; `fake_swap_only` worst on both by a wide margin), giving direct embedding-space evidence for what the confound audit above only suggested indirectly: the worse a rotation generalizes to unseen sources, the more its embedding space encodes *which source a clip came from* relative to *whether it's real or fake*.
+- `fake_swap_only`'s embeddings barely separate label better than source at all (0.1769 vs 0.1691, ratio 0.956) — i.e. for this training pairing (Kathbath + SEA-Spoof), the model's internal representation has almost collapsed the real/fake distinction into the source-identity distinction. This is a direct mechanistic explanation for that cell's near-chance-ranking AUC (0.6273, see 2026-07-24 factorial entry above), not just a correlation.
+- `main` (pooled random split, the "suspiciously perfect" EER=0.0000 model from 2026-07-23) has the *lowest* shortcut_ratio of all five and by far the highest label-silhouette (0.4608) — consistent with that model having no incentive to be source-invariant (it saw every source in training) and instead learning a representation that separates label very cleanly *for sources it has seen*, which is exactly why its pooled metrics were misleadingly perfect but say nothing about unseen-source generalization.
+- **Open question from 2026-07-24 (factorial entry) substantially answered:** the mechanism is a genuine interaction between recording-channel silence/padding statistics (confound audit above) and the resulting embedding-space geometry (this entry) — SEA-Spoof's higher internal heterogeneity in silence statistics appears to prevent the model from cleanly separating it from Kathbath along the real/fake axis, collapsing much of that axis into a source-identity axis instead. Still not fully isolated to a single root cause (would need a controlled intervention, e.g. loudness/silence-normalizing all sources before training and re-running the factorial, to move from correlational to causal evidence) — noted as future work.
+- **For the paper:** this embedding diagnostic plus the confound audit together upgrade the factorial's finding from "generalization varies by source pairing" (observed) to "generalization varies with how much the embedding space conflates source identity with label, which itself tracks measurable channel-level heterogeneity in the training sources" (partially explained) — a stronger claim, with the causal intervention flagged as the natural next experiment rather than a gap.
