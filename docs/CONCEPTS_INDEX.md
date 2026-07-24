@@ -1,6 +1,6 @@
-# Concept guide — index
+# Concept — Index
 
-This is a living set of plain-language explanations for the ideas used across this project — written to build actual understanding you can reason from and defend under cross-questions, not dictionary definitions. Each one lives next to the code it explains, so it stays easy to find while you're reading that part of the project:
+This is a living set of explanations for the ideas used across this project — written to build actual understanding. Each one lives next to the code it explains, so it stays easy to find while you're reading that part of the project:
 
 | Folder | What it explains |
 |---|---|
@@ -13,7 +13,7 @@ This is a living set of plain-language explanations for the ideas used across th
 | [`scripts/CONCEPTS.md`](../scripts/CONCEPTS.md) | Shortcut learning, confounds, cross-source holdout testing, domain shift, calibration, embedding-space/t-SNE/silhouette analysis |
 | [`deployment/CONCEPTS.md`](../deployment/CONCEPTS.md) | Training vs. inference, why the model loads once, Flask API vs. Gradio UI |
 
-## How to use this for your defense / viva
+## How to use this?
 
 Each file ends with a **"Rational summary"** section. Read the main text first for the intuition, then use those Q&A sections to rehearse explaining it out loud in your own words.
 
@@ -25,8 +25,6 @@ The throughline across almost every file is the same real finding from this proj
 4. **`evaluation/`** — this is exactly why the project reports EER/AUC/precision/recall/confusion matrices side by side instead of a single accuracy number: each metric exposes a different part of this story (a pooled-split model scored perfectly on accuracy while still carrying the shortcut).
 5. **`explainability/`** — Grad-CAM offers a second, independent way to check the same question by inspecting *what the model looked at* on individual clips.
 6. **`deployment/`** — and it's exactly this generalization gap that explains why an unfamiliar real-world input (like an ElevenLabs Hindi TTS clip, from a synthesis system never seen in training) can be misclassified with high confidence, even though the model performs very well on its own benchmark.
-
-If you can explain that six-step chain in your own words, using the vocabulary from each file, you can defend this project's methodology under most cross-questioning.
 
 ## Keeping this updated
 

@@ -1,8 +1,8 @@
-# Deepfake Audio Detector
+# Deepfake Audio Detection
 
 Binary classification of audio clips as **real human speech** or **AI-generated / synthetic speech**, built on EfficientNet-B0 (+ optional BiLSTM temporal head) over mel-spectrogram / MFCC / LFCC features. Initial focus: Hindi, drawing real speech from [Kathbath](https://huggingface.co/datasets/ai4bharat/Kathbath) and Common Voice Hindi, and synthetic speech from [IndicSynth](https://huggingface.co/datasets/vdivyasharma/IndicSynth) and [SEA-Spoof](https://huggingface.co/datasets/Jack-ppkdczgx/SEA-Spoof) — multiple sources per class deliberately, so "real vs fake" isn't confounded with "which dataset."
 
-New to a term used in this README or in the code (EER, mel-spectrogram, shortcut learning, Grad-CAM, ...)? See **[docs/CONCEPTS_INDEX.md](docs/CONCEPTS_INDEX.md)** — plain-language explanations, one file per folder, written for understanding and defense (viva/cross-questions), not dictionary definitions.
+New to a term used in this README or in the code (EER, mel-spectrogram, shortcut learning, Grad-CAM, ...)? See **[docs/CONCEPTS_INDEX.md](docs/CONCEPTS_INDEX.md)** — written for understanding, not dictionary definitions.
 
 ## Design principles
 
