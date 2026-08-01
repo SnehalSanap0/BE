@@ -53,35 +53,19 @@ ingestion:
   language: "hindi"
   hf_token_env_var: "HF_TOKEN"
   real:
-    - dataset: "ai4bharat/Kathbath"
-      config_name: "hindi"
-      split: "valid"
+    - dataset: "Jack-ppkdczgx/SEA-Spoof"
+      config_name: null
+      split: "train"
       label: "real"
-      audio_field: "audio_filepath"
+      audio_field: "audio"
       target_count: 3000
-      source_tag: "real"
-    - dataset: "SayantanJoker/Common_voice_hindi_denoised_male"
-      config_name: null
-      split: "train"
-      label: "real"
-      audio_field: "audio"
-      target_count: 750
-      source_tag: "real_cv_m"
-    - dataset: "SayantanJoker/Common_voice_hindi_denoised_female"
-      config_name: null
-      split: "train"
-      label: "real"
-      audio_field: "audio"
-      target_count: 750
-      source_tag: "real_cv_f"
+      source_tag: "real_sea"
+      filters:
+        - field: "language"
+          value: "hi"
+        - field: "label"
+          value: "bonafide"
   fake:
-    - dataset: "vdivyasharma/IndicSynth"
-      config_name: "Hindi"
-      split: "train"
-      label: "fake"
-      audio_field: "audio"
-      target_count: 3000
-      source_tag: "fake"
     - dataset: "Jack-ppkdczgx/SEA-Spoof"
       config_name: null
       split: "train"

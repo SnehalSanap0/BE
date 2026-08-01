@@ -27,6 +27,11 @@ LABEL_TO_INDEX: dict[str, int] = {"real": 0, "fake": 1}
 INDEX_TO_LABEL: dict[int, str] = {index: label for label, index in LABEL_TO_INDEX.items()}
 
 
+def _configured_source_tags() -> tuple[str, ...]:
+    """Return source tags currently enabled for ingestion/training."""
+    return tuple(source.source_tag for source in (*CONFIG.ingestion.real, *CONFIG.ingestion.fake))
+
+
 class DeepfakeAudioDataset(Dataset):
     """Serves feature-extracted clips belonging to one dataset split.
 
@@ -57,13 +62,24 @@ class DeepfakeAudioDataset(Dataset):
 
         manager = metadata_manager or MetadataManager(CONFIG.paths.metadata_file)
         split_df = manager.get_by_split(split)
-        self._records = split_df[split_df["feature_extracted"].astype(bool)].reset_index(drop=True)
+        extracted_df = split_df[split_df["feature_extracted"].astype(bool)]
+
+        source_tags = _configured_source_tags()
+        if source_tags:
+            source_prefixes = tuple(f"{source_tag}_" for source_tag in source_tags)
+            source_mask = extracted_df["filepath"].map(
+                lambda filepath: Path(str(filepath)).name.startswith(source_prefixes)
+            )
+            extracted_df = extracted_df[source_mask]
+
+        self._records = extracted_df.reset_index(drop=True)
 
         if len(self._records) == 0:
             raise ValueError(
                 f"No feature-extracted records found for split '{split}'. "
                 "Run preprocessing.pipeline, feature_extraction.pipeline and "
-                "dataset.split_assigner before constructing this dataset."
+                "dataset.split_assigner before constructing this dataset. "
+                f"Currently enabled source tags: {', '.join(source_tags)}."
             )
 
         logger.info("Loaded %d record(s) for split '%s'.", len(self._records), split)
