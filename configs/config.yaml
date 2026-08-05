@@ -71,7 +71,7 @@ ingestion:
       split: "train"
       label: "fake"
       audio_field: "audio"
-      target_count: 1500
+      target_count: 3000
       source_tag: "fake_sea"
       filters:
         - field: "language"

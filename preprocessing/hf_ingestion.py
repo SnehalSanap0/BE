@@ -27,6 +27,17 @@ Design rationale:
         rather than just IndicSynth's, so the fake class isn't defined by
         one synthesis technique's artifacts.
 
+    SEA-Spoof's paired bonafide/spoof ingestion (:func:`ingest_paired_sources`)
+    does not use ``datasets``' ``streaming=True`` mode. SEA-Spoof's parquet
+    shards live behind HuggingFace's Xet storage backend, and streaming mode
+    cannot use the fast Xet transfer path for it — it falls back to slow,
+    single-connection, timeout-prone sequential HTTP range requests (confirmed
+    by direct measurement: it could not finish downloading a single ~1.5GB
+    shard in over an hour). Instead, each needed shard is downloaded once via
+    :func:`huggingface_hub.hf_hub_download`, which does use the fast Xet path
+    (measured ~4-5 minutes per shard, vs. never completing one via streaming),
+    and queried locally with ``pyarrow`` for matched pairs.
+
 Authentication:
     ``ai4bharat/Kathbath`` and ``Jack-ppkdczgx/SEA-Spoof`` are gated
     datasets. Before running this module you must (1) accept each one's
@@ -42,8 +53,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pyarrow.parquet as pq
 from datasets import Audio, load_dataset
 from datasets.exceptions import DatasetNotFoundError
+from huggingface_hub import HfApi, hf_hub_download
 from tqdm import tqdm
 
 from configs.config import CONFIG, HFSourceConfig
@@ -105,6 +118,89 @@ def _matches_filters(example: dict, filters: tuple[tuple[str, str], ...]) -> boo
         ``True`` if every filter's column equals its required value.
     """
     return all(str(example.get(field)) == value for field, value in filters)
+
+
+def _filter_value(source: HFSourceConfig, field: str) -> str | None:
+    """Return one configured filter value for ``field``, if present."""
+    for filter_field, value in source.filters:
+        if filter_field == field:
+            return value
+    return None
+
+
+def _non_label_filters(source: HFSourceConfig) -> tuple[tuple[str, str], ...]:
+    """Return filters that should apply to both sides of a paired source."""
+    return tuple((field, value) for field, value in source.filters if field != "label")
+
+
+def _pair_key(example: dict) -> str | None:
+    """Pick a stable transcript-pairing key from a SEA-Spoof example.
+
+    ``utterance_id`` encodes the synthesis system for spoof rows (e.g.
+    ``hindi_indic_indic-tts_0001581_hindi_offline``), so it never matches a
+    bonafide row's id. ``text`` — the transcript spoof clips were synthesized
+    from — is the only field that actually links a bonafide clip to its spoof
+    counterpart(s); confirmed against real SEA-Spoof rows before relying on it.
+    """
+    text = example.get("text")
+    if text is None:
+        return None
+    normalized = str(text).strip()
+    return normalized or None
+
+
+def _audio_extension(audio_entry: dict, fallback: str = ".wav") -> str:
+    """Infer an output extension from a HuggingFace audio entry."""
+    source_name = audio_entry.get("path") or f"clip{fallback}"
+    return Path(source_name).suffix or fallback
+
+
+def _write_audio_bytes(output_path: Path, audio_entry: dict) -> None:
+    """Write one HuggingFace audio entry's raw bytes to disk."""
+    output_path.write_bytes(audio_entry["bytes"])
+
+
+def _list_train_shards(dataset: str, split: str, hf_token: str | None) -> list[str]:
+    """List a split's parquet shard filenames in a HuggingFace dataset repo, in order.
+
+    Args:
+        dataset: HuggingFace dataset repo id (e.g. ``Jack-ppkdczgx/SEA-Spoof``).
+        split: Split name (e.g. ``train``).
+        hf_token: HuggingFace access token, or ``None`` for ungated datasets.
+
+    Returns:
+        Sorted list of repo-relative parquet filenames for the split.
+    """
+    prefix = f"data/{split}/"
+    files = HfApi(token=hf_token).list_repo_files(repo_id=dataset, repo_type="dataset")
+    return sorted(f for f in files if f.startswith(prefix) and f.endswith(".parquet"))
+
+
+def _download_shard(dataset: str, filename: str, hf_token: str | None) -> Path:
+    """Download one parquet shard via the fast Xet transfer path, or reuse the local cache.
+
+    Args:
+        dataset: HuggingFace dataset repo id.
+        filename: Repo-relative parquet filename, as returned by :func:`_list_train_shards`.
+        hf_token: HuggingFace access token, or ``None`` for ungated datasets.
+
+    Returns:
+        Local filesystem path to the downloaded (or already-cached) shard.
+    """
+    return Path(hf_hub_download(repo_id=dataset, repo_type="dataset", filename=filename, token=hf_token))
+
+
+def _sources_form_pair(real_source: HFSourceConfig, fake_source: HFSourceConfig) -> bool:
+    """Check whether two configured sources can be streamed as matched pairs."""
+    return (
+        real_source.dataset == fake_source.dataset
+        and real_source.config_name == fake_source.config_name
+        and real_source.split == fake_source.split
+        and real_source.audio_field == fake_source.audio_field
+        and _filter_value(real_source, "label") == "bonafide"
+        and _filter_value(fake_source, "label") == "spoof"
+        and _non_label_filters(real_source) == _non_label_filters(fake_source)
+    )
 
 
 def ingest_source(
@@ -191,14 +287,13 @@ def ingest_source(
             skipped += 1
             continue
 
-        source_name = audio_entry.get("path") or f"clip_{already_present + newly_written}.wav"
-        extension = Path(source_name).suffix or ".wav"
+        extension = _audio_extension(audio_entry)
 
         clip_id = f"{source.source_tag}_{already_present + newly_written:06d}{extension}"
         output_path = destination_dir / clip_id
 
         try:
-            output_path.write_bytes(audio_entry["bytes"])
+            _write_audio_bytes(output_path, audio_entry)
         except OSError as exc:
             logger.warning("Failed to write clip %s: %s", output_path, exc)
             skipped += 1
@@ -221,6 +316,330 @@ def ingest_source(
     return {"already_present": already_present, "newly_written": newly_written, "skipped": skipped}
 
 
+def ingest_paired_sources(
+    real_source: HFSourceConfig,
+    fake_source: HFSourceConfig,
+    language: str,
+    raw_dir: Path,
+    hf_token: str | None,
+) -> dict[str, dict[str, int]]:
+    """Ingest SEA-Spoof as transcript-matched bonafide/spoof pairs.
+
+    The ordinary ``ingest_source`` path samples each label independently. For
+    SEA-Spoof, the useful training unit is a pair: one bonafide clip and one
+    spoof clip sharing the same transcript. This function keeps the
+    downstream folder layout unchanged while ensuring both classes receive
+    the same number of matched examples.
+
+    Shards are downloaded once each (see :func:`_download_shard`) and queried
+    locally with pyarrow: first for the metadata columns needed to pick
+    matched transcript keys, then again (same cached files, no re-download)
+    for the audio bytes of just those keys. Shards are only fetched as
+    needed, in order, stopping as soon as enough matched pairs are found.
+    """
+    real_dir = raw_dir / language / real_source.label
+    fake_dir = raw_dir / language / fake_source.label
+    real_dir.mkdir(parents=True, exist_ok=True)
+    fake_dir.mkdir(parents=True, exist_ok=True)
+
+    real_existing = _existing_clip_count(real_dir, real_source.source_tag)
+    fake_existing = _existing_clip_count(fake_dir, fake_source.source_tag)
+    complete_existing_pairs = min(real_existing, fake_existing)
+    next_pair_index = max(real_existing, fake_existing)
+    target_pairs = min(real_source.target_count, fake_source.target_count)
+    remaining = max(0, target_pairs - complete_existing_pairs)
+
+    if real_source.target_count != fake_source.target_count:
+        logger.warning(
+            "Paired sources %s/%s have different target_count values (%d vs %d); "
+            "using %d matched pair(s).",
+            real_source.source_tag,
+            fake_source.source_tag,
+            real_source.target_count,
+            fake_source.target_count,
+            target_pairs,
+        )
+
+    if real_existing != fake_existing:
+        logger.warning(
+            "Existing paired source counts are imbalanced (%s=%d, %s=%d). "
+            "New pair numbering will continue at %d.",
+            real_source.source_tag,
+            real_existing,
+            fake_source.source_tag,
+            fake_existing,
+            next_pair_index,
+        )
+
+    if remaining == 0:
+        logger.info(
+            "Skipping paired %s/%s (%s): already have %d/%d matched pair(s).",
+            real_source.source_tag,
+            fake_source.source_tag,
+            language,
+            complete_existing_pairs,
+            target_pairs,
+        )
+        summary = {"already_present": complete_existing_pairs, "newly_written": 0, "skipped": 0}
+        return {real_source.source_tag: summary, fake_source.source_tag: summary.copy()}
+
+    label_to_source = {
+        _filter_value(real_source, "label"): real_source,
+        _filter_value(fake_source, "label"): fake_source,
+    }
+    common_filters = _non_label_filters(real_source)
+    real_label_value = _filter_value(real_source, "label")
+    fake_label_value = _filter_value(fake_source, "label")
+    if real_label_value is None or fake_label_value is None:
+        raise ValueError("Paired SEA-Spoof sources must both define a label filter.")
+
+    try:
+        shard_filenames = _list_train_shards(real_source.dataset, real_source.split, hf_token)
+    except Exception as exc:
+        raise DatasetAccessError(
+            f"Cannot list shards for '{real_source.dataset}'. If this is a gated dataset, accept its terms on "
+            f"huggingface.co while logged in, create a read token at "
+            f"huggingface.co/settings/tokens, and set it in the "
+            f"'{CONFIG.ingestion.hf_token_env_var}' environment variable."
+        ) from exc
+
+    if not shard_filenames:
+        raise DatasetAccessError(
+            f"No parquet shards found for split '{real_source.split}' in '{real_source.dataset}'."
+        )
+
+    logger.info(
+        "Pairing %s (%s/%s): need %d more matched bonafide/spoof pair(s); %d shard(s) available.",
+        real_source.dataset,
+        real_source.config_name,
+        real_source.split,
+        remaining,
+        len(shard_filenames),
+    )
+    logger.info(
+        "First pass downloads shards once each (Xet-accelerated) and scans metadata only "
+        "to choose %d transcript-matched key(s); audio bytes are fetched afterward from the same cached shards.",
+        remaining,
+    )
+
+    pending_labels_by_key: dict[str, set[str]] = {}
+    selected_keys: list[str] = []
+    selected_key_set: set[str] = set()
+    rows_seen = 0
+    common_filter_matches = 0
+    bonafide_seen = 0
+    spoof_seen = 0
+    duplicate_sides = 0
+    skipped = 0
+    scanned_shards: list[str] = []
+
+    for shard_filename in shard_filenames:
+        if len(selected_keys) >= remaining:
+            break
+
+        shard_path = _download_shard(real_source.dataset, shard_filename, hf_token)
+        scanned_shards.append(shard_filename)
+        shard_rows_seen = 0
+        shard_matched = 0
+
+        for batch in pq.ParquetFile(shard_path).iter_batches(columns=["text", "language", "label"]):
+            if len(selected_keys) >= remaining:
+                break
+            for row in batch.to_pylist():
+                rows_seen += 1
+                shard_rows_seen += 1
+
+                if common_filters and not _matches_filters(row, common_filters):
+                    continue
+                common_filter_matches += 1
+
+                label_value = str(row.get("label"))
+                if label_value not in label_to_source:
+                    continue
+
+                if label_value == real_label_value:
+                    bonafide_seen += 1
+                elif label_value == fake_label_value:
+                    spoof_seen += 1
+
+                key = _pair_key(row)
+                if key is None:
+                    skipped += 1
+                    continue
+
+                labels_for_key = pending_labels_by_key.setdefault(key, set())
+                if label_value in labels_for_key:
+                    duplicate_sides += 1
+                    continue
+                labels_for_key.add(label_value)
+
+                if real_label_value not in labels_for_key or fake_label_value not in labels_for_key:
+                    continue
+
+                if key not in selected_key_set:
+                    selected_keys.append(key)
+                    selected_key_set.add(key)
+                    shard_matched += 1
+                pending_labels_by_key.pop(key, None)
+
+                if len(selected_keys) >= remaining:
+                    break
+
+        logger.info(
+            "Pair metadata scan: shard %s done (%d row(s) in shard, %d newly matched key(s)); "
+            "%d row(s) scanned overall, %d matched language/filter, %d bonafide, %d spoof, "
+            "%d pending key(s), %d/%d key(s) selected.",
+            shard_filename,
+            shard_rows_seen,
+            shard_matched,
+            rows_seen,
+            common_filter_matches,
+            bonafide_seen,
+            spoof_seen,
+            len(pending_labels_by_key),
+            len(selected_keys),
+            remaining,
+        )
+
+    if len(selected_keys) < remaining:
+        logger.warning(
+            "Exhausted all %d available shard(s) after scanning %d row(s): only found %d/%d matched key(s).",
+            len(shard_filenames),
+            rows_seen,
+            len(selected_keys),
+            remaining,
+        )
+
+    logger.info(
+        "Metadata pass selected %d/%d matched key(s) after scanning %d row(s) across %d shard(s): "
+        "%d matched language/filter, %d bonafide, %d spoof, %d skipped, %d duplicate side(s).",
+        len(selected_keys),
+        remaining,
+        rows_seen,
+        len(scanned_shards),
+        common_filter_matches,
+        bonafide_seen,
+        spoof_seen,
+        skipped,
+        duplicate_sides,
+    )
+
+    if not selected_keys:
+        logger.warning("No matched bonafide/spoof transcript keys found; no audio will be written.")
+        summary = {"already_present": complete_existing_pairs, "newly_written": 0, "skipped": skipped}
+        return {real_source.source_tag: summary, fake_source.source_tag: summary.copy()}
+
+    logger.info(
+        "Second pass re-reads the same %d cached shard(s) for audio bytes of %d selected key(s).",
+        len(scanned_shards),
+        len(selected_keys),
+    )
+
+    audio_by_key: dict[str, dict[str, dict]] = {}
+    audio_rows_seen = 0
+    audio_skipped = 0
+
+    for shard_filename in scanned_shards:
+        complete_audio_pairs = sum(
+            1 for pair in audio_by_key.values() if real_label_value in pair and fake_label_value in pair
+        )
+        if complete_audio_pairs >= len(selected_keys):
+            break
+
+        shard_path = _download_shard(real_source.dataset, shard_filename, hf_token)
+
+        for batch in pq.ParquetFile(shard_path).iter_batches(columns=["text", "label", real_source.audio_field]):
+            for row in batch.to_pylist():
+                audio_rows_seen += 1
+                key = _pair_key(row)
+                label_value = str(row.get("label"))
+                if key not in selected_key_set or label_value not in label_to_source:
+                    continue
+
+                audio_entry = row.get(real_source.audio_field)
+                if not audio_entry or not audio_entry.get("bytes"):
+                    audio_skipped += 1
+                    continue
+
+                audio_by_key.setdefault(key, {})[label_value] = audio_entry
+
+            complete_audio_pairs = sum(
+                1 for pair in audio_by_key.values() if real_label_value in pair and fake_label_value in pair
+            )
+            if complete_audio_pairs >= len(selected_keys):
+                break
+
+        logger.info(
+            "Pair audio fetch: shard %s done; %d row(s) seen so far, %d/%d complete audio pair(s), %d skipped.",
+            shard_filename,
+            audio_rows_seen,
+            complete_audio_pairs,
+            len(selected_keys),
+            audio_skipped,
+        )
+
+    newly_written_pairs = 0
+    write_skipped = 0
+    progress = tqdm(total=len(selected_keys), desc=f"{language}/paired/{real_source.source_tag}+{fake_source.source_tag}")
+
+    for key in selected_keys:
+        pair = audio_by_key.get(key, {})
+        if real_label_value not in pair or fake_label_value not in pair:
+            write_skipped += 1
+            continue
+
+        pair_index = next_pair_index + newly_written_pairs
+        real_audio = pair[real_label_value]
+        fake_audio = pair[fake_label_value]
+        real_path = real_dir / f"{real_source.source_tag}_{pair_index:06d}{_audio_extension(real_audio)}"
+        fake_path = fake_dir / f"{fake_source.source_tag}_{pair_index:06d}{_audio_extension(fake_audio)}"
+
+        try:
+            _write_audio_bytes(real_path, real_audio)
+            _write_audio_bytes(fake_path, fake_audio)
+        except OSError as exc:
+            logger.warning("Failed to write paired clips %s / %s: %s", real_path, fake_path, exc)
+            real_path.unlink(missing_ok=True)
+            fake_path.unlink(missing_ok=True)
+            write_skipped += 1
+            continue
+
+        newly_written_pairs += 1
+        progress.update(1)
+
+    progress.close()
+
+    logger.info(
+        "Finished paired %s/%s (%s): %d already present, %d newly written pair(s), "
+        "%d metadata skipped, %d audio skipped, %d write skipped, %d metadata row(s) scanned "
+        "across %d shard(s), %d matched language/filter, %d bonafide, %d spoof, "
+        "%d duplicate side(s), %d selected audio row(s) seen.",
+        real_source.source_tag,
+        fake_source.source_tag,
+        language,
+        complete_existing_pairs,
+        newly_written_pairs,
+        skipped,
+        audio_skipped,
+        write_skipped,
+        rows_seen,
+        len(scanned_shards),
+        common_filter_matches,
+        bonafide_seen,
+        spoof_seen,
+        duplicate_sides,
+        audio_rows_seen,
+    )
+
+    real_summary = {
+        "already_present": complete_existing_pairs,
+        "newly_written": newly_written_pairs,
+        "skipped": skipped + audio_skipped + write_skipped,
+    }
+    fake_summary = real_summary.copy()
+    return {real_source.source_tag: real_summary, fake_source.source_tag: fake_summary}
+
+
 def ingest_all() -> dict[str, dict[str, int]]:
     """Ingest every real and fake source dataset per ``CONFIG.ingestion``.
 
@@ -230,7 +649,40 @@ def ingest_all() -> dict[str, dict[str, int]]:
     hf_token = _resolve_hf_token(CONFIG.ingestion.hf_token_env_var)
 
     results: dict[str, dict[str, int]] = {}
-    for source in (*CONFIG.ingestion.real, *CONFIG.ingestion.fake):
+    paired_fake_tags: set[str] = set()
+
+    for real_source in CONFIG.ingestion.real:
+        paired_fake = next(
+            (
+                fake_source
+                for fake_source in CONFIG.ingestion.fake
+                if fake_source.source_tag not in paired_fake_tags and _sources_form_pair(real_source, fake_source)
+            ),
+            None,
+        )
+        if paired_fake is None:
+            results[real_source.source_tag] = ingest_source(
+                source=real_source,
+                language=CONFIG.ingestion.language,
+                raw_dir=CONFIG.paths.raw_dir,
+                hf_token=hf_token,
+            )
+            continue
+
+        results.update(
+            ingest_paired_sources(
+                real_source=real_source,
+                fake_source=paired_fake,
+                language=CONFIG.ingestion.language,
+                raw_dir=CONFIG.paths.raw_dir,
+                hf_token=hf_token,
+            )
+        )
+        paired_fake_tags.add(paired_fake.source_tag)
+
+    for source in CONFIG.ingestion.fake:
+        if source.source_tag in paired_fake_tags:
+            continue
         results[source.source_tag] = ingest_source(
             source=source,
             language=CONFIG.ingestion.language,
