@@ -85,6 +85,46 @@ Watch TensorBoard during/after training with:
 tensorboard --logdir logs/tensorboard
 ```
 
+## Fast paired SEA-Spoof smoke run
+
+For a quick end-to-end GPU/pipeline check on transcript-matched Hindi real/spoof pairs, use the isolated smoke config. This writes only to `data/smoke_seaspoof_paired/`, `checkpoints/smoke_seaspoof_paired/`, `logs/smoke_seaspoof_paired/`, and `outputs/smoke_seaspoof_paired/`.
+
+```powershell
+# Use the environment that has torch installed.
+.\venv312\Scripts\Activate.ps1
+
+# Optional sanity check: should print True and your NVIDIA GPU name.
+python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU only')"
+
+# Run paired SEA-Spoof ingestion, preprocessing, feature extraction, split,
+# training, and evaluation using configs/config.smoke_seaspoof.yaml.
+$env:DEEPFAKE_CONFIG_PATH="configs/config.smoke_seaspoof.yaml"
+python -m scripts.run_paired_seaspoof_smoke
+```
+
+`configs/config.smoke_seaspoof.yaml` currently uses SEA-Spoof `validation`, paired by transcript, with `real_sea`/`fake_sea` targets. If the dataset shard order causes slow scans, the paired ingester supports two optional controls:
+
+```powershell
+# Scan validation shards from the end first.
+$env:SEA_SPOOF_SHARD_REVERSE="1"
+python -m scripts.run_paired_seaspoof_smoke
+
+# Or skip the first N shards.
+Remove-Item Env:\SEA_SPOOF_SHARD_REVERSE -ErrorAction SilentlyContinue
+$env:SEA_SPOOF_SHARD_START_INDEX="3"
+python -m scripts.run_paired_seaspoof_smoke
+```
+
+To inspect what EfficientNet sees for matching real/spoof transcripts, render side-by-side `.npy` feature comparisons:
+
+```powershell
+# Saves real | spoof | spoof-real PNGs under outputs/smoke_seaspoof_paired/paired_spectrograms/.
+python -m scripts.plot_paired_spectrograms --limit 10
+
+# Render one specific pair by filename suffix, e.g. real_sea_000042.wav / fake_sea_000042.wav.
+python -m scripts.plot_paired_spectrograms --pair-id 000042
+```
+
 ## Cross-source generalization check
 
 `dataset.split_assigner` splits train/val/test randomly across the *pooled* clips, so every source dataset ends up in all three splits. That lets a model hit misleadingly perfect metrics by learning "which recording chain is this" instead of genuine spoofing artifacts. `scripts/cross_source_holdout_check.py` re-splits by *source* instead, so the model trains on some sources and is evaluated only on sources it has never seen:

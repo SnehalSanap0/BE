@@ -176,6 +176,27 @@ def _list_train_shards(dataset: str, split: str, hf_token: str | None) -> list[s
     return sorted(f for f in files if f.startswith(prefix) and f.endswith(".parquet"))
 
 
+def _ordered_pairing_shards(shard_filenames: list[str]) -> list[str]:
+    """Apply optional shard-order overrides for quick SEA-Spoof smoke runs."""
+    ordered = list(shard_filenames)
+
+    start_raw = os.environ.get("SEA_SPOOF_SHARD_START_INDEX")
+    if start_raw:
+        try:
+            start_index = int(start_raw)
+        except ValueError:
+            logger.warning("Ignoring invalid SEA_SPOOF_SHARD_START_INDEX=%r.", start_raw)
+        else:
+            ordered = ordered[start_index:]
+            logger.info("Starting SEA-Spoof paired scan at shard index %d.", start_index)
+
+    if os.environ.get("SEA_SPOOF_SHARD_REVERSE", "").strip().lower() in {"1", "true", "yes"}:
+        ordered = list(reversed(ordered))
+        logger.info("Scanning SEA-Spoof paired shards in reverse order.")
+
+    return ordered
+
+
 def _download_shard(dataset: str, filename: str, hf_token: str | None) -> Path:
     """Download one parquet shard via the fast Xet transfer path, or reuse the local cache.
 
@@ -407,6 +428,7 @@ def ingest_paired_sources(
         raise DatasetAccessError(
             f"No parquet shards found for split '{real_source.split}' in '{real_source.dataset}'."
         )
+    shard_filenames = _ordered_pairing_shards(shard_filenames)
 
     logger.info(
         "Pairing %s (%s/%s): need %d more matched bonafide/spoof pair(s); %d shard(s) available.",
@@ -547,9 +569,15 @@ def ingest_paired_sources(
             break
 
         shard_path = _download_shard(real_source.dataset, shard_filename, hf_token)
+        parquet_file = pq.ParquetFile(shard_path)
 
-        for batch in pq.ParquetFile(shard_path).iter_batches(columns=["text", "label", real_source.audio_field]):
-            for row in batch.to_pylist():
+        for row_group_index in range(parquet_file.num_row_groups):
+            table = parquet_file.read_row_group(
+                row_group_index,
+                columns=["text", "label", real_source.audio_field],
+                use_threads=False,
+            )
+            for row in table.to_pylist():
                 audio_rows_seen += 1
                 key = _pair_key(row)
                 label_value = str(row.get("label"))

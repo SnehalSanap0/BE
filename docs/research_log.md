@@ -153,3 +153,67 @@ To test the shortcut-learning hypothesis directly rather than only via proxy sig
 - `main` (pooled random split, the "suspiciously perfect" EER=0.0000 model from 2026-07-23) has the *lowest* shortcut_ratio of all five and by far the highest label-silhouette (0.4608) — consistent with that model having no incentive to be source-invariant (it saw every source in training) and instead learning a representation that separates label very cleanly *for sources it has seen*, which is exactly why its pooled metrics were misleadingly perfect but say nothing about unseen-source generalization.
 - **Open question from 2026-07-24 (factorial entry) substantially answered:** the mechanism is a genuine interaction between recording-channel silence/padding statistics (confound audit above) and the resulting embedding-space geometry (this entry) — SEA-Spoof's higher internal heterogeneity in silence statistics appears to prevent the model from cleanly separating it from Kathbath along the real/fake axis, collapsing much of that axis into a source-identity axis instead. Still not fully isolated to a single root cause (would need a controlled intervention, e.g. loudness/silence-normalizing all sources before training and re-running the factorial, to move from correlational to causal evidence) — noted as future work.
 - **For the paper:** this embedding diagnostic plus the confound audit together upgrade the factorial's finding from "generalization varies by source pairing" (observed) to "generalization varies with how much the embedding space conflates source identity with label, which itself tracks measurable channel-level heterogeneity in the training sources" (partially explained) — a stronger claim, with the causal intervention flagged as the natural next experiment rather than a gap.
+
+---
+
+### 2026-08-06 - Paired Hindi SEA-Spoof smoke pipeline
+
+Added a separate smoke-test path for paired Hindi SEA-Spoof bonafide/spoof examples:
+- Config: `configs/config.smoke_seaspoof.yaml`
+- Runner: `scripts/run_paired_seaspoof_smoke.py`
+- Artifact roots: `data/smoke_seaspoof_paired/`, `checkpoints/smoke_seaspoof_paired/`, `logs/smoke_seaspoof_paired/`, `outputs/smoke_seaspoof_paired/`
+
+**Why:** the immediate test was whether the model can train on transcript-matched Hindi real/spoof pairs so content/transcript is less likely to define the label. SEA-Spoof is the better immediate dataset than MHDDV for this repo because `preprocessing.hf_ingestion.ingest_paired_sources` already pairs SEA-Spoof bonafide/spoof rows by transcript (`text`) and writes matched `real_sea_000000.*` / `fake_sea_000000.*` files.
+
+**Implementation notes:**
+- `configs.config` now supports `DEEPFAKE_CONFIG_PATH`, so the smoke run can use an isolated config without editing the main `configs/config.yaml`.
+- SEA-Spoof `train` shards were too large and ordered poorly for a quick test; smoke config uses `split: validation`, which contained enough Hindi bonafide/spoof transcript matches in `validation-00000.parquet`.
+- Added optional shard scan controls for future quick tests: `SEA_SPOOF_SHARD_REVERSE=1` and `SEA_SPOOF_SHARD_START_INDEX=N`.
+- Fixed a PyArrow crash in the second audio-fetch pass (`ArrowNotImplementedError: Nested data conversions not implemented for chunked array outputs`) by reading the nested `audio` struct row-group-wise instead of via `iter_batches`.
+
+**Smoke progression:**
+- 12 pairs, 2 epochs: pipeline completed, but the model collapsed to predicting one class; test set was only 4 clips, so metrics were not meaningful.
+- 100 pairs, pretrained EfficientNet, more epochs: model stopped collapsing and reached `accuracy=0.8333`, `f1=0.8387`, `roc_auc=0.9156`, `eer=0.2333` on a 30-clip test set.
+- 500 pairs, pretrained EfficientNet-B0, batch size 32, 15 epochs: latest saved smoke metrics in `outputs/smoke_seaspoof_paired/smoke_test_metrics.json`.
+- Final 1000-pair checkpoint model: `accuracy=0.9866`, `precision=1.0000`, `recall=0.9732`, `f1=0.9864`, `roc_auc=1.0000`, `eer=0.0000`, `eer_threshold=0.0735`. Confusion matrix: 149/149 real correctly classified, 145/149 fake correctly classified, 4 fake clips missed as real.
+- Attempting to scale validation smoke ingestion to 1500 pairs was inefficient: after 1000 existing pairs, `validation-00000.parquet` found only 261 additional matched keys and `validation-00001.parquet` found 0, while each shard download is multi-GB. Conclusion: SEA-Spoof validation is enough for smoke/Gradio testing, but chasing larger paired counts through validation shards is not a good training-data strategy.
+
+| metric | value |
+|---|---:|
+| accuracy | 0.9533 |
+| precision | 0.9250 |
+| recall | 0.9867 |
+| f1 | 0.9548 |
+| roc_auc | 0.9964 |
+| eer | 0.0400 |
+| eer_threshold | 0.5403 |
+
+Confusion matrix:
+
+| actual \ predicted | real | fake |
+|---|---:|---:|
+| real | 69 | 6 |
+| fake | 1 | 74 |
+
+**Interpretation:** this is a successful paired same-source pipeline check, not cross-source evidence. The model can learn a strong decision boundary on transcript-paired SEA-Spoof validation examples, and the end-to-end GPU path is working. Because train/val/test all come from SEA-Spoof validation-derived paired examples, these metrics may still include SEA-Spoof-specific artifacts and should not replace the cross-source factorial as the generalization result.
+
+**Code note:** the `preprocessing/hf_ingestion.py` row-group audio read is required for SEA-Spoof paired ingestion because PyArrow failed on nested `audio` batch conversion. The shard-order environment controls are not required for correctness; they are a convenience for avoiding badly ordered shards during quick smoke runs.
+
+---
+
+### 2026-08-06 - Paired spectrogram viewer for real/spoof inspection
+
+Added `scripts/plot_paired_spectrograms.py` to render extracted `.npy` feature maps for matched SEA-Spoof pairs.
+
+**Why:** if `real_sea_000042.wav` and `fake_sea_000042.wav` share the same transcript, comparing their extracted mel-spectrogram arrays helps inspect what EfficientNet is likely seeing. The third panel (`spoof - real`) highlights visible differences such as high-frequency texture, silence/padding, energy distribution, or preprocessing artifacts.
+
+**Usage:**
+
+```powershell
+python -m scripts.plot_paired_spectrograms --limit 10
+python -m scripts.plot_paired_spectrograms --pair-id 000042
+```
+
+Outputs are written to `outputs/smoke_seaspoof_paired/paired_spectrograms/`.
+
+**Methodological use:** these plots are qualitative diagnostics. If visible differences are dominated by padding/silence or other channel-level cues rather than speech-region spoof artifacts, that suggests the next controlled experiment should normalize or crop speech-active regions before retraining.
