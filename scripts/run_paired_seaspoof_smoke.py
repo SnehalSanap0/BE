@@ -24,7 +24,7 @@ import torch  # noqa: E402
 
 from configs.config import CONFIG  # noqa: E402
 from dataset.dataloader import build_dataloader  # noqa: E402
-from dataset.split_assigner import assign_splits  # noqa: E402
+from dataset.split_assigner import assign_grouped_splits  # noqa: E402
 from evaluation.evaluator import Evaluator  # noqa: E402
 from feature_extraction.pipeline import FeatureExtractionPipeline  # noqa: E402
 from models.model_factory import build_model  # noqa: E402
@@ -88,7 +88,9 @@ def main() -> None:
     FeatureExtractionPipeline(metadata_manager=manager).run()
 
     manager = MetadataManager(CONFIG.paths.metadata_file)
-    manager = assign_splits(manager)
+    # Rebuild old row-stratified smoke splits: paired members must never be
+    # separated across train/validation/test.
+    manager = assign_grouped_splits(manager, group_column="transcript", force_reassign=True)
 
     train_loader = build_dataloader("train", metadata_manager=manager)
     val_loader = build_dataloader("val", metadata_manager=manager)

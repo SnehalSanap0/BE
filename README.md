@@ -87,6 +87,25 @@ tensorboard --logdir logs/tensorboard
 
 ## Fast paired SEA-Spoof smoke run
 
+Paired runs now assign splits by transcript group, so all real/spoof clips
+sharing a transcript remain in one partition. Independently audit a manifest
+with `python -m scripts.audit_experiment_protocol` while its config is active.
+
+For the publication-scale 3,000-pair run from SEA-Spoof `train`:
+
+```powershell
+$env:DEEPFAKE_CONFIG_PATH="configs/config.paper_seaspoof.yaml"
+python -m scripts.run_paired_seaspoof_experiment --seed 42
+```
+
+Repeat with independently trained seeds. For reproducible cross-source
+sampling with saved clip-level scores and manifests:
+
+```powershell
+$env:DEEPFAKE_CONFIG_PATH="configs/config.smoke_seaspoof.yaml"
+python -m scripts.evaluate_cross_source_protocol --samples-per-source 100 --seeds 42 1337 2026
+```
+
 For a quick end-to-end GPU/pipeline check on transcript-matched Hindi real/spoof pairs, use the isolated smoke config. This writes only to `data/smoke_seaspoof_paired/`, `checkpoints/smoke_seaspoof_paired/`, `logs/smoke_seaspoof_paired/`, and `outputs/smoke_seaspoof_paired/`.
 
 ```powershell
@@ -115,6 +134,8 @@ $env:SEA_SPOOF_SHARD_START_INDEX="3"
 python -m scripts.run_paired_seaspoof_smoke
 ```
 
+**Do not set `DEEPFAKE_CONFIG_PATH` in `.env`** — `.env` is loaded on every run (not just smoke runs), so a value left there silently overrides `config.yaml` for everything, including the main pipeline. Set it as a session environment variable (`$env:DEEPFAKE_CONFIG_PATH=...`, as above) each time you want the smoke config, not as a persisted `.env` entry.
+
 To inspect what EfficientNet sees for matching real/spoof transcripts, render side-by-side `.npy` feature comparisons:
 
 ```powershell
@@ -124,6 +145,31 @@ python -m scripts.plot_paired_spectrograms --limit 10
 # Render one specific pair by filename suffix, e.g. real_sea_000042.wav / fake_sea_000042.wav.
 python -m scripts.plot_paired_spectrograms --pair-id 000042
 ```
+
+### Verifying real/fake pairing
+
+Paired ingestion (`ingest_paired_sources`) matches real/fake clips by transcript, and the filename index (`real_sea_000042` / `fake_sea_000042`) reflects that pairing — but the filename convention doesn't survive preprocessing or feature extraction (both stages rename files to a UUID `audio_id`). To make pairing checkable at every stage, not just in `data/raw/`, ingestion also records each pair's transcript into `metadata.csv`'s `transcript` column (via a `pair_transcripts.csv` sidecar the metadata bootstrap reads once). This only happens for clips ingested after this feature was added — older rows show an empty transcript rather than a false mismatch.
+
+```powershell
+# Rebuild metadata.csv (backfills the transcript column from pair_transcripts.csv for any newly-discovered files).
+python -m preprocessing.metadata_builder
+
+# Check that every real_sea/fake_sea pair actually shares the same transcript.
+python -m scripts.verify_seaspoof_pairing
+```
+
+### Sanity-checking the smoke model against the four earlier sources
+
+Quick, no-retraining check of whether the SEA-Spoof smoke checkpoint generalizes at all to the project's four earlier, never-trained-on sources (Kathbath, Common Voice Hindi male, Common Voice Hindi female, IndicSynth). It loads `checkpoints/smoke_seaspoof_paired/best_model.pt`, draws a random sample of raw clips per source straight from `data/raw/hindi/{real,fake}`, and reports plain per-source and overall accuracy. This is a smoke test, not a paper-grade result (no fixed protocol, single run) — treat a promising number as a reason to run the proper `cross_source_holdout_check.py` protocol below, not as a result to cite.
+
+```powershell
+# Must use the smoke config so feature extraction (image_size, n_mels, etc.)
+# matches what the checkpoint was trained on.
+$env:DEEPFAKE_CONFIG_PATH="configs/config.smoke_seaspoof.yaml"
+python -m scripts.eval_smoke_model_on_legacy_sources --samples-per-source 15
+```
+
+Writes `outputs/smoke_seaspoof_paired/legacy_source_eval.json` (per-clip predictions, per-source accuracy, confusion counts). Pass `--seed` to change which random clips are sampled, or `--checkpoint` to point at a different checkpoint file.
 
 ## Cross-source generalization check
 

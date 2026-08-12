@@ -50,6 +50,7 @@ Authentication:
 
 from __future__ import annotations
 
+import csv
 import os
 from pathlib import Path
 
@@ -158,6 +159,41 @@ def _audio_extension(audio_entry: dict, fallback: str = ".wav") -> str:
 def _write_audio_bytes(output_path: Path, audio_entry: dict) -> None:
     """Write one HuggingFace audio entry's raw bytes to disk."""
     output_path.write_bytes(audio_entry["bytes"])
+
+
+#: Sidecar filename (one per language directory) mapping a written clip's
+#: filename to the transcript it was paired/selected by. Written here rather
+#: than into metadata.csv directly, since raw ingestion never touches
+#: metadata.csv -- :mod:`preprocessing.metadata_builder` is the sole writer of
+#: that file. ``metadata_builder`` reads this sidecar when it discovers a raw
+#: file with a matching filename and copies the transcript into its
+#: ``transcript`` column, so pairing can be verified from metadata.csv alone
+#: (matching ``real_sea_NNNNNN`` / ``fake_sea_NNNNNN`` transcripts) instead of
+#: only being implied by filename-index matching.
+PAIR_TRANSCRIPTS_FILENAME = "pair_transcripts.csv"
+
+
+def _append_pair_transcripts(language_dir: Path, records: list[tuple[str, str]]) -> None:
+    """Append ``(filename, transcript)`` rows to this language's transcript sidecar.
+
+    Args:
+        language_dir: ``raw_dir / language`` directory (parent of the
+            ``real``/``fake`` label subdirectories).
+        records: ``(filename, transcript)`` pairs to append. Filenames are
+            basenames only (e.g. ``real_sea_001500.flac``), not full paths.
+    """
+    if not records:
+        return
+
+    sidecar_path = language_dir / PAIR_TRANSCRIPTS_FILENAME
+    is_new_file = not sidecar_path.exists()
+    language_dir.mkdir(parents=True, exist_ok=True)
+
+    with sidecar_path.open("a", newline="", encoding="utf-8") as file_handle:
+        writer = csv.writer(file_handle)
+        if is_new_file:
+            writer.writerow(["filename", "transcript"])
+        writer.writerows(records)
 
 
 def _list_train_shards(dataset: str, split: str, hf_token: str | None) -> list[str]:
@@ -608,6 +644,7 @@ def ingest_paired_sources(
 
     newly_written_pairs = 0
     write_skipped = 0
+    new_transcript_records: list[tuple[str, str]] = []
     progress = tqdm(total=len(selected_keys), desc=f"{language}/paired/{real_source.source_tag}+{fake_source.source_tag}")
 
     for key in selected_keys:
@@ -632,10 +669,13 @@ def ingest_paired_sources(
             write_skipped += 1
             continue
 
+        new_transcript_records.append((real_path.name, key))
+        new_transcript_records.append((fake_path.name, key))
         newly_written_pairs += 1
         progress.update(1)
 
     progress.close()
+    _append_pair_transcripts(raw_dir / language, new_transcript_records)
 
     logger.info(
         "Finished paired %s/%s (%s): %d already present, %d newly written pair(s), "

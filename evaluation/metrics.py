@@ -13,8 +13,10 @@ from __future__ import annotations
 import numpy as np
 from sklearn.metrics import (
     accuracy_score,
+    balanced_accuracy_score,
     confusion_matrix,
     f1_score,
+    matthews_corrcoef,
     precision_score,
     recall_score,
     roc_auc_score,
@@ -86,12 +88,16 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_scores: np.ndarray
 
     eer, eer_threshold = compute_eer(y_true, y_scores)
     conf_matrix = confusion_matrix(y_true, y_pred).tolist()
+    balanced_accuracy = balanced_accuracy_score(y_true, y_pred)
+    mcc = matthews_corrcoef(y_true, y_pred)
 
     return {
         "accuracy": float(accuracy),
+        "balanced_accuracy": float(balanced_accuracy),
         "precision": float(precision),
         "recall": float(recall),
         "f1": float(f1),
+        "mcc": float(mcc),
         "roc_auc": roc_auc,
         "eer": eer,
         "eer_threshold": eer_threshold,

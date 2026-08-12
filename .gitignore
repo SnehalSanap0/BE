@@ -15,6 +15,7 @@ data/processed/
 data/features/
 data/metadata/*.csv
 data/smoke_seaspoof_paired
+data/paper_seaspoof_paired
 
 # Logs, checkpoints, outputs
 logs/

@@ -1,0 +1,338 @@
+\documentclass[conference]{IEEEtran}
+
+\usepackage[T1]{fontenc}
+\usepackage{cite}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{url}
+\usepackage{xcolor}
+
+\title{Beyond Same-Corpus Accuracy: A Cross-Source Study of Hindi Audio Deepfake Detection}
+
+\author{
+\IEEEauthorblockN{Prathmesh Pravin Sanap, Shivam Vinod Shewale, Yash Vinayak Jadhav, Snehal Sandeep Sanap}
+\IEEEauthorblockA{Department of Computer Engineering\\
+K. K. Wagh Institute of Engineering Education and Research, Nashik, India\\
+Under the guidance of Prof. S. S. Bhandare}
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Audio deepfake detectors can score almost perfectly when their training and
+test data come from the same dataset. However, they may fail when the audio
+comes from a new source. We study this problem for Hindi speech. We use real
+speech from Kathbath and Common Voice, and synthetic speech from IndicSynth
+and SEA-Spoof. Early source-held-out experiments produced equal error rates
+(EERs) between 3.74\% and 40.46\%. They also showed that the model was
+learning differences between datasets, including silence and recording
+conditions. We therefore trained the model with real and fake clips that had
+the same transcript. This prevents the words in a clip from becoming a
+shortcut for the label. Three EfficientNet-B0 models were trained on 3,000
+checked SEA-Spoof transcript pairs. The models were almost perfect on
+held-out SEA-Spoof data. On unseen sources, mean balanced accuracy was
+89.07\% (SD 1.15), ROC-AUC was 0.9501 (SD 0.0205), and EER was 10.98\%
+(SD 3.69). Most errors came from Kathbath: only 39.44\% of its real clips
+were classified correctly. Accuracy on every other external source was above
+98.6\%. The results show why deepfake detectors must be tested on sources
+that are absent from training. They also show that matching transcripts does
+not remove every dataset-specific effect.
+\end{abstract}
+
+\begin{IEEEkeywords}
+audio deepfake detection, Hindi speech, cross-source evaluation,
+transcript pairing, EfficientNet, source bias
+\end{IEEEkeywords}
+
+\section{Introduction}
+Modern text-to-speech and voice-conversion systems can create convincing
+synthetic speech. This creates risks for voice authentication, media
+verification, and digital forensics. A detector must therefore do more than
+separate the examples in one benchmark. It should also work when speakers,
+recording devices, codecs, and synthesis systems change.
+
+This requirement is difficult to measure. Real and fake clips often come
+from different datasets. A model can then learn which dataset produced a
+clip instead of learning general signs of synthesis. Random train--test
+splits make this problem worse because every source appears in both parts of
+the experiment. Prior work has reported large losses when audio deepfake
+detectors are moved to unseen data~\cite{muller2022generalize,muller2024harder}.
+
+We investigate this problem for Hindi. Our first pooled experiment achieved
+perfect test scores, but source-held-out results varied widely. Signal and
+embedding checks suggested that recording and silence patterns were acting
+as shortcuts. We then built a larger experiment using transcript-paired
+SEA-Spoof data~\cite{wu2025seaspoof}. Each selected transcript had one real
+and one fake clip, and all clips with the same transcript were kept in one
+partition.
+
+This paper makes three contributions:
+\begin{itemize}
+    \item a leakage-checked protocol for transcript-paired Hindi deepfake
+    detection;
+    \item a three-seed cross-source evaluation on genuine and synthetic
+    sources that were absent from training; and
+    \item a source-level error analysis that identifies Kathbath, rather
+    than the unseen fake generator, as the main failure case.
+\end{itemize}
+
+We do not claim that transcript pairing is better than ordinary sampling.
+That claim needs a count-matched non-paired control, which is left for future
+work. Our present claim is narrower: same-corpus scores greatly overstate
+performance, and the remaining errors are strongly source dependent.
+
+\section{Related Work}
+Audio deepfake detection is often studied using spectral representations or
+learned waveform features. Müller et al.~\cite{muller2022generalize} compared
+several detection systems under a common setup and showed that performance
+can fall sharply outside established benchmarks. Their later analysis found
+that cross-domain failure is driven mainly by differences between domains,
+not simply by one domain containing harder fakes~\cite{muller2024harder}.
+Kawa et al.~\cite{kawa2022attack} also studied attack-independent evaluation
+and used disjoint attacks to measure generalization.
+
+Self-supervised speech representations are another strong direction. Pascu
+et al.~\cite{pascu2024calibrated} showed that frozen pretrained
+representations with a small classifier can generalize well across several
+deepfake datasets. Our study instead uses a compact image-based baseline so
+that the effect of dataset construction and source shift can be examined
+with a simple, reproducible pipeline.
+
+Hindi and other Indian languages have fewer deepfake benchmarks than
+English. SEA-Spoof provides paired real and spoof speech for several South
+and Southeast Asian languages, including Hindi~\cite{wu2025seaspoof}.
+Kathbath is part of IndicSUPERB and contains labelled speech from 12 Indian
+languages~\cite{javed2022indicsuperb}. IndicSynth provides synthetic speech
+for low-resource Indian languages~\cite{sharma2025indicsynth}. We use these
+resources to study transfer between independent Hindi sources.
+
+\section{Data}
+Table~\ref{tab:data} summarizes the data used in the final experiment.
+SEA-Spoof is the only training source. Kathbath, Common Voice, and IndicSynth
+are used only for external evaluation. Common Voice is a crowdsourced,
+multilingual speech corpus~\cite{ardila2020commonvoice}.
+
+\begin{table}[t]
+\caption{Datasets used in the final experiment}
+\label{tab:data}
+\centering
+\small
+\begin{tabular}{llll}
+\toprule
+Dataset & Label & Role & Samples/seed \\
+\midrule
+SEA-Spoof Hindi & real+fake & train/val/test & 6,000 total \\
+Kathbath Hindi & real & external test & 100 \\
+Common Voice male & real & external test & 100 \\
+Common Voice female & real & external test & 100 \\
+IndicSynth Hindi & fake & external test & 100 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Transcript-Paired Training Set}
+We selected 3,000 Hindi transcripts from the SEA-Spoof training split. For
+each transcript, we kept one bona fide clip and one spoof clip. The final
+corpus therefore contained 6,000 clips. A protocol audit checked the
+following conditions:
+\begin{itemize}
+    \item all 3,000 transcript groups contained both labels;
+    \item no transcript appeared in more than one partition;
+    \item no transcript or feature path was missing; and
+    \item no file path was duplicated.
+\end{itemize}
+
+For each run, transcript groups were shuffled using the training seed and
+split 80/10/10. This gave 4,800 training clips, 600 validation clips, and
+600 same-corpus test clips. Both labels were exactly balanced in every
+partition.
+
+\subsection{External Evaluation Data}
+We evaluated each trained model on three deterministic sample manifests.
+Each manifest contained 100 clips from each external source. A manifest thus
+contained 300 real clips and 100 fake clips. Because the classes were not
+balanced, we emphasize balanced accuracy, EER, and ROC-AUC rather than raw
+accuracy. The sample seeds were 42, 1337, and 2026. These seeds change the
+selected external clips; they do not retrain the model.
+
+\section{Method}
+\subsection{Audio Preprocessing}
+Every clip was converted to mono at 16~kHz. Silence was removed with a
+30~dB threshold, the waveform was peak-normalized, and the result was padded
+or truncated to four seconds. We computed a log-mel spectrogram with 128 mel
+bands, a 1,024-sample FFT and window, a 512-sample hop, and a frequency range
+of 0--8~kHz. Each feature map was resized to $224\times224$.
+
+\subsection{Classifier and Training}
+The classifier was an ImageNet-pretrained EfficientNet-B0~\cite{tan2019efficientnet}
+adapted for a single-channel spectrogram and two output classes. We did not
+use the optional BiLSTM in the reported experiments. The backbone was
+fine-tuned with AdamW, a learning rate of $3\times10^{-4}$, weight decay of
+$10^{-5}$, batch size 32, cosine learning-rate scheduling, mixed precision,
+and gradient clipping at 5.0. Training was limited to 50 epochs and stopped
+after seven epochs without improvement in validation F1. The best
+validation-F1 checkpoint was used for evaluation.
+
+We trained three models with seeds 42, 1337, and 2026. The seed controlled
+the transcript split, initial weights, and batch order. This is more useful
+than reporting a single favorable run because it measures sensitivity to
+random training choices.
+
+\subsection{Metrics}
+We report accuracy, balanced accuracy, precision, recall, F1, Matthews
+correlation coefficient (MCC), ROC-AUC, and EER. EER is the operating point
+at which the false-positive and false-negative rates are equal. For each
+model, we first averaged the three external sample runs. We then calculated
+the mean and sample standard deviation across the three independently
+trained models.
+
+\section{Pilot Source-Shift Analysis}
+Before the final experiment, we trained four models using different pairs of
+real and fake sources. Each model was tested on the complementary sources.
+Table~\ref{tab:factorial} shows that performance depended strongly on which
+sources were used for training. These were single-run pilot experiments and
+are included as motivation, not as the final comparison.
+
+\begin{table}[t]
+\caption{Pilot source-held-out experiments}
+\label{tab:factorial}
+\centering
+\small
+\begin{tabular}{llrr}
+\toprule
+Training real & Training fake & ROC-AUC & EER \\
+\midrule
+Kathbath & IndicSynth & 0.9939 & 0.0374 \\
+Common Voice & IndicSynth & 0.8165 & 0.2325 \\
+Common Voice & SEA-Spoof & 0.8761 & 0.2160 \\
+Kathbath & SEA-Spoof & 0.6273 & 0.4046 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The worst model had almost equal embedding separation for source identity
+and class label. Signal checks also found large source differences in
+silence and trailing padding. These checks do not prove causation, but they
+explain why a source-resolved final evaluation was necessary.
+
+\section{Results}
+\subsection{Same-Corpus Evaluation}
+All three models were almost perfect on held-out SEA-Spoof data. Test
+accuracy ranged from 0.9950 to 1.0000. This confirms that the paired task is
+learnable without transcript leakage. It does not show that the detector
+will generalize to another dataset.
+
+\subsection{Cross-Source Evaluation}
+Table~\ref{tab:main-results} reports the result for each trained model. Each
+row is the average of that model's three external manifests. The final row
+reports variation across model-training seeds.
+
+\begin{table*}[t]
+\caption{Cross-source results. Mean $\pm$ SD is calculated across three independently trained models.}
+\label{tab:main-results}
+\centering
+\begin{tabular}{lrrrrrr}
+\toprule
+Training seed & Accuracy & Balanced acc. & F1 & ROC-AUC & EER & MCC \\
+\midrule
+42   & 0.8625 & 0.9039 & 0.7825 & 0.9625 & 0.0922 & 0.7210 \\
+1337 & 0.8242 & 0.8828 & 0.7400 & 0.9615 & 0.0850 & 0.6706 \\
+2026 & 0.8400 & 0.8856 & 0.7534 & 0.9264 & 0.1522 & 0.6827 \\
+\midrule
+Mean $\pm$ SD & $0.8422\pm0.0193$ & $0.8907\pm0.0115$ & $0.7586\pm0.0217$ & $0.9501\pm0.0205$ & $0.1098\pm0.0369$ & $0.6914\pm0.0264$ \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+The same-corpus EER was near zero, while cross-source EER increased to
+10.98\% on average. Model seed 2026 was weaker than the other models, with
+15.22\% EER. This shows why results from one seed can be misleading.
+
+\subsection{Source-Level Errors}
+Table~\ref{tab:source-results} shows that the loss was not spread evenly
+across datasets. The models were almost perfect on both Common Voice subsets
+and on unseen IndicSynth fake speech. In contrast, mean accuracy on Kathbath
+was only 39.44\%.
+
+\begin{table}[t]
+\caption{Accuracy by external source}
+\label{tab:source-results}
+\centering
+\small
+\begin{tabular}{llrr}
+\toprule
+Source & Label & Mean acc. & Manifest range \\
+\midrule
+Kathbath & real & 0.3944 & 0.28--0.53 \\
+Common Voice male & real & 1.0000 & 1.00--1.00 \\
+Common Voice female & real & 0.9867 & 0.97--0.99 \\
+IndicSynth & fake & 0.9878 & 0.95--1.00 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The aggregate accuracy is therefore mainly reduced by real Kathbath clips
+being labelled as fake. The unseen fake generator was not the main problem.
+This result is consistent with the earlier observation that recording and
+silence properties can become shortcuts. The high ROC-AUC alongside lower
+fixed-threshold F1 also suggests a calibration shift: score ranking remains
+useful even when a fixed decision threshold produces many errors.
+
+\section{Discussion}
+The experiment gives two clear results. First, same-corpus performance is an
+optimistic upper bound. A model can be perfect on held-out examples from the
+same source and still fail on a new genuine-speech corpus. Second,
+cross-source failure must be reported separately for each source. An
+aggregate score alone would hide the fact that almost all errors came from
+Kathbath.
+
+Transcript pairing removes one possible shortcut: the spoken text cannot be
+associated with only one class. It does not remove microphones, codecs,
+speakers, silence patterns, or generator artifacts. The results therefore
+show that content control is useful for building a cleaner experiment, but
+it is not a complete solution to domain shift.
+
+The present study does not measure the causal improvement from pairing. The
+classifier receives individual spectrograms and does not use a pairwise loss.
+A fair comparison requires an equally sized training set whose real and fake
+transcripts are not matched, while keeping the architecture, optimization,
+and external manifests fixed. We leave this control to future work rather
+than claiming an unsupported improvement.
+
+\section{Limitations}
+This study has several limitations. It covers Hindi only. Speaker IDs were
+not preserved in the metadata, so speaker-disjoint splits could not be
+verified. The external manifests contain 100 clips per source and overlap
+across sampling seeds; a fixed exhaustive test set would be stronger. We
+used three training seeds and one model family. No count-matched non-paired
+control or normalization ablation was completed. We also did not compute
+minimum tandem detection cost because the experiment did not include a
+compatible automatic speaker verification system. Finally, Kathbath
+performance is too low for the detector to be used as a reliable real-world
+decision system.
+
+\section{Ethical Considerations}
+Audio deepfake detection can support media verification and fraud analysis,
+but its output is not proof that a person acted deceptively. False positives
+can wrongly label genuine speech as fake, as the Kathbath results clearly
+show. Such a detector should not be the sole decision maker in a legal,
+financial, or identity-verification setting. Dataset licenses and consent
+conditions must be followed, and restricted audio should not be
+redistributed with the code.
+
+\section{Conclusion}
+Three transcript-paired Hindi deepfake detectors were almost perfect on
+held-out SEA-Spoof data but reached 10.98\% $\pm$ 3.69\% EER on external
+sources. ROC-AUC remained 0.9501 $\pm$ 0.0205. The loss was concentrated on
+Kathbath genuine speech, while Common Voice and IndicSynth accuracy stayed
+above 98.6\%. These findings show that same-corpus accuracy can hide a large,
+source-specific weakness. Future work should add a count-matched non-paired
+control, test silence and loudness normalization, retain speaker IDs, and
+compare EfficientNet-B0 with a speech-specific baseline.
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\end{document}
