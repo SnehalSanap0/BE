@@ -160,6 +160,7 @@ class IngestionConfig:
     hf_token_env_var: str
     real: tuple[HFSourceConfig, ...]
     fake: tuple[HFSourceConfig, ...]
+    allow_pairing: bool = True
 
 
 @dataclass(frozen=True)
@@ -355,6 +356,7 @@ def load_config(config_path: Path | None = None) -> Config:
         hf_token_env_var=ingestion_raw["hf_token_env_var"],
         real=_hf_source_list(ingestion_raw["real"]),
         fake=_hf_source_list(ingestion_raw["fake"]),
+        allow_pairing=ingestion_raw.get("allow_pairing", True),
     )
 
     features_raw = raw["features"]

@@ -98,7 +98,18 @@ $env:DEEPFAKE_CONFIG_PATH="configs/config.paper_seaspoof.yaml"
 python -m scripts.run_paired_seaspoof_experiment --seed 42
 ```
 
-Repeat with independently trained seeds. For reproducible cross-source
+Repeat with independently trained seeds.
+
+For the E1 control condition — ordinary, non-paired, count-matched SEA-Spoof
+training (same sources/counts/model/budget as the E2 run above, but real/fake
+clips are sampled independently instead of matched by transcript):
+
+```powershell
+$env:DEEPFAKE_CONFIG_PATH="configs/config.paper_seaspoof_e1.yaml"
+python -m scripts.run_nonpaired_seaspoof_experiment --seed 42
+```
+
+For reproducible cross-source
 sampling with saved clip-level scores and manifests:
 
 ```powershell

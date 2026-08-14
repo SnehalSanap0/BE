@@ -708,6 +708,150 @@ def ingest_paired_sources(
     return {real_source.source_tag: real_summary, fake_source.source_tag: fake_summary}
 
 
+def ingest_cosourced_independent(
+    real_source: HFSourceConfig,
+    fake_source: HFSourceConfig,
+    language: str,
+    raw_dir: Path,
+    hf_token: str | None,
+) -> dict[str, dict[str, int]]:
+    """Ingest bonafide/spoof clips independently from one shared shard pool.
+
+    Used for the E1 (non-paired) control: ``real_source``/``fake_source``
+    point at the same dataset/split (e.g. SEA-Spoof ``train``), same as
+    :func:`ingest_paired_sources`, but clips are *not* matched by transcript
+    — each label is simply filled up to its own ``target_count`` from
+    whichever rows match its filters, in scan order.
+
+    Shares :func:`_download_shard`'s local, cache-aware download with the
+    paired path so each shard is fetched from HuggingFace once total, not
+    once per label — using :func:`ingest_source`'s HF-streaming path here
+    instead would silently re-stream the same shard bytes twice (once per
+    label), roughly doubling transfer time for no benefit.
+    """
+    real_dir = raw_dir / language / real_source.label
+    fake_dir = raw_dir / language / fake_source.label
+    real_dir.mkdir(parents=True, exist_ok=True)
+    fake_dir.mkdir(parents=True, exist_ok=True)
+
+    real_existing = _existing_clip_count(real_dir, real_source.source_tag)
+    fake_existing = _existing_clip_count(fake_dir, fake_source.source_tag)
+    real_remaining = max(0, real_source.target_count - real_existing)
+    fake_remaining = max(0, fake_source.target_count - fake_existing)
+
+    if real_remaining == 0 and fake_remaining == 0:
+        logger.info(
+            "Skipping co-sourced %s/%s (%s): already have %d/%d and %d/%d clip(s).",
+            real_source.source_tag, fake_source.source_tag, language,
+            real_existing, real_source.target_count, fake_existing, fake_source.target_count,
+        )
+        return {
+            real_source.source_tag: {"already_present": real_existing, "newly_written": 0, "skipped": 0},
+            fake_source.source_tag: {"already_present": fake_existing, "newly_written": 0, "skipped": 0},
+        }
+
+    try:
+        shard_filenames = _list_train_shards(real_source.dataset, real_source.split, hf_token)
+    except Exception as exc:
+        raise DatasetAccessError(
+            f"Cannot list shards for '{real_source.dataset}'. If this is a gated dataset, accept its terms on "
+            f"huggingface.co while logged in, create a read token at "
+            f"huggingface.co/settings/tokens, and set it in the "
+            f"'{CONFIG.ingestion.hf_token_env_var}' environment variable."
+        ) from exc
+    if not shard_filenames:
+        raise DatasetAccessError(
+            f"No parquet shards found for split '{real_source.split}' in '{real_source.dataset}'."
+        )
+    shard_filenames = _ordered_pairing_shards(shard_filenames)
+
+    columns = sorted({real_source.audio_field}
+                      | {field for field, _ in real_source.filters}
+                      | {field for field, _ in fake_source.filters})
+
+    logger.info(
+        "Co-sourced independent ingest %s/%s (%s): need %d real + %d fake more clip(s); %d shard(s) available.",
+        real_source.source_tag, fake_source.source_tag, language,
+        real_remaining, fake_remaining, len(shard_filenames),
+    )
+
+    real_written = 0
+    fake_written = 0
+    skipped = 0
+    rows_seen = 0
+    real_progress = tqdm(total=real_remaining, desc=f"{language}/{real_source.label}/{real_source.source_tag}")
+    fake_progress = tqdm(total=fake_remaining, desc=f"{language}/{fake_source.label}/{fake_source.source_tag}")
+
+    for shard_filename in shard_filenames:
+        if real_written >= real_remaining and fake_written >= fake_remaining:
+            break
+
+        shard_path = _download_shard(real_source.dataset, shard_filename, hf_token)
+        parquet_file = pq.ParquetFile(shard_path)
+
+        for row_group_index in range(parquet_file.num_row_groups):
+            if real_written >= real_remaining and fake_written >= fake_remaining:
+                break
+            table = parquet_file.read_row_group(row_group_index, columns=columns, use_threads=False)
+            for row in table.to_pylist():
+                if real_written >= real_remaining and fake_written >= fake_remaining:
+                    break
+                rows_seen += 1
+
+                if real_written < real_remaining and _matches_filters(row, real_source.filters):
+                    source, dest_dir, index = real_source, real_dir, real_existing + real_written
+                elif fake_written < fake_remaining and _matches_filters(row, fake_source.filters):
+                    source, dest_dir, index = fake_source, fake_dir, fake_existing + fake_written
+                else:
+                    continue
+
+                audio_entry = row.get(source.audio_field)
+                if not audio_entry or not audio_entry.get("bytes"):
+                    skipped += 1
+                    continue
+
+                output_path = dest_dir / f"{source.source_tag}_{index:06d}{_audio_extension(audio_entry)}"
+                try:
+                    _write_audio_bytes(output_path, audio_entry)
+                except OSError as exc:
+                    logger.warning("Failed to write clip %s: %s", output_path, exc)
+                    skipped += 1
+                    continue
+
+                if source is real_source:
+                    real_written += 1
+                    real_progress.update(1)
+                else:
+                    fake_written += 1
+                    fake_progress.update(1)
+
+        logger.info(
+            "Co-sourced scan: shard %s done; %d row(s) seen so far, %d/%d real, %d/%d fake, %d skipped.",
+            shard_filename, rows_seen, real_written, real_remaining, fake_written, fake_remaining, skipped,
+        )
+
+    real_progress.close()
+    fake_progress.close()
+
+    if real_written < real_remaining or fake_written < fake_remaining:
+        logger.warning(
+            "Exhausted all %d available shard(s) after scanning %d row(s): only found %d/%d real, %d/%d fake.",
+            len(shard_filenames), rows_seen, real_written, real_remaining, fake_written, fake_remaining,
+        )
+
+    logger.info(
+        "Finished co-sourced %s/%s (%s): %d already present real, %d newly written real, "
+        "%d already present fake, %d newly written fake, %d skipped, %d row(s) scanned.",
+        real_source.source_tag, fake_source.source_tag, language,
+        real_existing, real_written, fake_existing, fake_written, skipped, rows_seen,
+    )
+
+    return {
+        real_source.source_tag: {"already_present": real_existing, "newly_written": real_written, "skipped": skipped},
+        fake_source.source_tag: {"already_present": fake_existing, "newly_written": fake_written, "skipped": 0},
+    }
+
+
 def ingest_all() -> dict[str, dict[str, int]]:
     """Ingest every real and fake source dataset per ``CONFIG.ingestion``.
 
@@ -720,7 +864,7 @@ def ingest_all() -> dict[str, dict[str, int]]:
     paired_fake_tags: set[str] = set()
 
     for real_source in CONFIG.ingestion.real:
-        paired_fake = next(
+        cosourced_fake = next(
             (
                 fake_source
                 for fake_source in CONFIG.ingestion.fake
@@ -728,7 +872,7 @@ def ingest_all() -> dict[str, dict[str, int]]:
             ),
             None,
         )
-        if paired_fake is None:
+        if cosourced_fake is None:
             results[real_source.source_tag] = ingest_source(
                 source=real_source,
                 language=CONFIG.ingestion.language,
@@ -737,16 +881,17 @@ def ingest_all() -> dict[str, dict[str, int]]:
             )
             continue
 
+        ingest_fn = ingest_paired_sources if CONFIG.ingestion.allow_pairing else ingest_cosourced_independent
         results.update(
-            ingest_paired_sources(
+            ingest_fn(
                 real_source=real_source,
-                fake_source=paired_fake,
+                fake_source=cosourced_fake,
                 language=CONFIG.ingestion.language,
                 raw_dir=CONFIG.paths.raw_dir,
                 hf_token=hf_token,
             )
         )
-        paired_fake_tags.add(paired_fake.source_tag)
+        paired_fake_tags.add(cosourced_fake.source_tag)
 
     for source in CONFIG.ingestion.fake:
         if source.source_tag in paired_fake_tags:

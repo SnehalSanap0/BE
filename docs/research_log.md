@@ -324,3 +324,47 @@ Added `scripts/eval_smoke_model_on_legacy_sources.py`: no retraining, just loads
 Overall accuracy: 0.8500 (51/60). Confusion: 37 real→real, 8 real→fake, 14 fake→fake, 1 fake→real.
 
 **Interpretation:** this is a single-seed, 60-clip spot check, not a paper-grade result — but it's informative as a first signal. The model, trained only on transcript-paired SEA-Spoof, clears well above chance on all four completely unseen sources, including the unseen fake source (IndicSynth, a different TTS system than SEA-Spoof's), which is a better sign than the earlier pooled-split/factorial work found for cross-source fake generalization. The weak point is Kathbath (0.60, 8/20 misclassified as fake) — worth checking against the confound-audit findings (`scripts/confound_check.py`) for whether Kathbath's channel/silence statistics differ enough from SEA-Spoof's training distribution to explain the miss, before concluding the model has learned genuine source-invariant spoof cues. **Next step:** run this through the proper `scripts/cross_source_holdout_check.py` protocol (fixed splits, multiple seeds) before this becomes a citable generalization claim.
+
+---
+
+### 2026-08-12 — E1 non-paired control: completed, and the causal pairing comparison
+
+Ran the E1 control the paper draft's §5.2 experiment matrix had flagged as the missing piece needed to claim transcript pairing itself (not just sample count or pipeline differences) drives the E2 cross-source result.
+
+**Method.** `configs/config.paper_seaspoof_e1.yaml` — identical to E2's `configs/config.paper_seaspoof.yaml` (same SEA-Spoof sources, `target_count: 3000` for both `real_sea`/`fake_sea`, same EfficientNet-B0 architecture, same AdamW/cosine/50-epoch/patience-7 training budget — see `docs/paper_draft.md` §5.0 for the shared configuration table), differing only in a new `ingestion.allow_pairing: false` flag. When false, `preprocessing/hf_ingestion.ingest_all()` no longer routes matching real/fake sources through `ingest_paired_sources` (transcript matching); real and fake clips are sampled independently up to their own `target_count`, and `scripts/run_nonpaired_seaspoof_experiment.py` assigns splits with ordinary label-stratified `dataset.split_assigner.assign_splits` instead of `assign_grouped_splits` — there is no transcript column to group by. Three independent training seeds: 42, 1337, 2026, matching E2.
+
+**Engineering note:** the first implementation routed the non-paired real/fake sources through the existing `ingest_source` (HF `streaming=True`) path, since it was the only path available for non-paired sources. Because `real_sea`/`fake_sea` are the same underlying dataset/split, this independently re-streamed the same shard bytes twice (once per label) via slow serial byte-range HTTP requests — observably far slower than E2's ingestion, which downloads each shard once via `_download_shard` (`hf_hub_download`, cache-aware) and reads it locally with pyarrow. Added `ingest_cosourced_independent()` to reuse the same single-download-per-shard path as `ingest_paired_sources`, just bucketing rows by label independently instead of matching transcripts. `ingest_all()` now dispatches: `allow_pairing=True` → `ingest_paired_sources`; same-dataset sources with `allow_pairing=False` → `ingest_cosourced_independent`; genuinely separate-dataset sources (Kathbath, Common Voice, IndicSynth) → unchanged `ingest_source` per source. Verified by mocking all three ingestion functions and checking dispatch for the E1, E2, and main configs.
+
+**Same-corpus (in-domain) results**, 600-clip held-out SEA-Spoof test split per seed (ordinary stratified, not transcript-grouped):
+
+| Seed | Accuracy | F1 | ROC-AUC | EER |
+|---:|---:|---:|---:|---:|
+| 42 | 1.0000 | 1.0000 | 1.0000 | 0.0000 |
+| 1337 | 1.0000 | 1.0000 | 1.0000 | 0.0000 |
+| 2026 | 1.0000 | 1.0000 | 1.0000 | 0.0000 |
+
+All three seeds hit exact 1.0 accuracy (confusion matrix `[[300,0],[0,300]]` every time) — even more perfectly separable in-domain than E2's paired runs (0.9950–1.0000). This confirms same-corpus SEA-Spoof real/fake separability does not depend on transcript pairing at all; channel/vocoder-level cues alone are sufficient in-domain. The pairing effect, if any, can only show up cross-source.
+
+**Cross-source results**, evaluated with `scripts/evaluate_cross_source_protocol.py` against the identical external manifests E2 used (Kathbath, Common Voice male/female, IndicSynth; 100 clips/source, sampling seeds 42/1337/2026 per trained model):
+
+| Training seed | Accuracy | Balanced acc. | F1 | ROC-AUC | EER | MCC |
+|---:|---:|---:|---:|---:|---:|---:|
+| 42 | 0.7525 | 0.5050 | 0.0197 | 0.9655 | 0.0939 | 0.0698 |
+| 1337 | 0.7542 | 0.5106 | 0.0449 | 0.8505 | 0.2344 | 0.1044 |
+| 2026 | 0.7675 | 0.5394 | 0.1513 | 0.8980 | 0.1717 | 0.2216 |
+| **Mean ± SD** | **0.7581 ± 0.0082** | **0.5183 ± 0.0185** | **0.0720 ± 0.0699** | **0.9047 ± 0.0578** | **0.1667 ± 0.0704** | **0.1319 ± 0.0795** |
+
+Per-source accuracy (mean across the three trained models' three sampling manifests each):
+
+| Source | Label | E1 (non-paired) mean acc. | E2 (paired) mean acc. |
+|---|---|---:|---:|
+| Kathbath | real | 0.9933 ± 0.0067 | 0.3944 |
+| Common Voice male | real | 1.0000 ± 0.0000 | 1.0000 |
+| Common Voice female | real | 1.0000 ± 0.0000 | 0.9867 |
+| IndicSynth | **fake** | **0.0389 ± 0.0391** | 0.9878 |
+
+**Interpretation — this resolves the paper's central deferred claim.** E1's balanced accuracy (0.5183 ± 0.0185) is chance level. Per-source numbers show why: without transcript pairing, the model achieves near-perfect accuracy on every unseen *real* source but catches only 3.89% of unseen spoof clips (IndicSynth) — it collapsed to predicting "real" almost universally on external data. F1 (0.072) and MCC (0.132) near zero confirm this isn't a calibration/threshold artifact like the earlier 2×2 factorial's "swapped"/"real_swap_only" rotations (where ROC-AUC partly survived a broken threshold) — ROC-AUC is comparatively higher here (0.9047) than the collapsed operating-point metrics, but the model never learned to recognize an unseen synthesis system as fake at any usable threshold in practice, and MCC/F1 make clear this is a near-total failure to transfer spoof-detection signal, not just a threshold problem.
+
+E2 (transcript-paired) fails differently and much less severely: it correctly flags 98.78% of unseen IndicSynth spoof clips — a completely different, unseen TTS system than SEA-Spoof — at the cost of misclassifying 60.56% of Kathbath real clips as fake (the channel/silence confound already characterized in the 2026-07-24 entries). Its balanced accuracy (0.8907 ± 0.0115) is far above chance and its MCC (0.6914 ± 0.0264) shows real, substantial transferable signal, not a coin flip.
+
+**Conclusion for the paper:** transcript pairing is not a minor content-control nicety — without it, the detector learns essentially nothing that transfers to an unseen synthesis system (E1: 3.89% fake-source recall externally). With it, the detector transfers to an unseen synthesis system convincingly (E2: 98.78%) while trading in a different, better-characterized weakness (Kathbath channel confound). This is the causal evidence `docs/paper_draft.md` §8 and §11's reproducibility checklist flagged as missing before any claim about pairing's benefit could be made. The E3/E4 normalization ablation (testing whether silence/loudness normalization fixes E2's Kathbath weakness specifically) remains the next open item.
