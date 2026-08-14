@@ -1,0 +1,121 @@
+# Fast paired Hindi SEA-Spoof smoke config.
+# Use via:
+#   $env:DEEPFAKE_CONFIG_PATH="configs/config.smoke_seaspoof.yaml"
+
+paths:
+  data_dir: "data/smoke_seaspoof_paired"
+  raw_dir: "data/smoke_seaspoof_paired/raw"
+  processed_dir: "data/smoke_seaspoof_paired/processed"
+  feature_dir: "data/smoke_seaspoof_paired/features"
+  metadata_dir: "data/smoke_seaspoof_paired/metadata"
+  metadata_file: "data/smoke_seaspoof_paired/metadata/metadata.csv"
+  log_dir: "logs/smoke_seaspoof_paired"
+  checkpoint_dir: "checkpoints/smoke_seaspoof_paired"
+  output_dir: "outputs/smoke_seaspoof_paired"
+  explanation_dir: "outputs/smoke_seaspoof_paired/explanations"
+
+audio:
+  sample_rate: 16000
+  mono: true
+  target_duration_seconds: 4
+  remove_silence: true
+  top_db: 30
+  normalize: true
+  pad_mode: "constant"
+  supported_formats: [".wav", ".flac", ".mp3", ".ogg"]
+
+dataset:
+  languages: ["hindi"]
+  labels: ["real", "fake"]
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+  random_seed: 42
+
+ingestion:
+  language: "hindi"
+  hf_token_env_var: "HF_TOKEN"
+  real:
+    - dataset: "Jack-ppkdczgx/SEA-Spoof"
+      config_name: null
+      split: "validation"
+      label: "real"
+      audio_field: "audio"
+      target_count: 500
+      source_tag: "real_sea"
+      filters:
+        - field: "language"
+          value: "hi"
+        - field: "label"
+          value: "bonafide"
+  fake:
+    - dataset: "Jack-ppkdczgx/SEA-Spoof"
+      config_name: null
+      split: "validation"
+      label: "fake"
+      audio_field: "audio"
+      target_count: 500
+      source_tag: "fake_sea"
+      filters:
+        - field: "language"
+          value: "hi"
+        - field: "label"
+          value: "spoof"
+
+features:
+  type: "mel_spectrogram"
+  n_mels: 128
+  n_mfcc: 40
+  n_lfcc: 40
+  n_fft: 1024
+  hop_length: 512
+  win_length: 1024
+  fmin: 0
+  fmax: 8000
+  power: 2.0
+  log_scale: true
+  image_size: 128
+
+model:
+  backbone: "efficientnet_b0"
+  pretrained: true
+  num_classes: 2
+  use_bilstm: false
+  lstm_hidden_size: 256
+  lstm_num_layers: 2
+  lstm_bidirectional: true
+  dropout: 0.3
+  freeze_backbone: false
+
+training:
+  batch_size: 32
+  num_epochs: 10
+  learning_rate: 0.0003
+  weight_decay: 0.00001
+  optimizer: "adamw"
+  scheduler: "cosine"
+  early_stopping_patience: 2
+  early_stopping_min_delta: 0.0001
+  mixed_precision: true
+  gradient_clip_norm: 5.0
+  num_workers: 0
+  checkpoint_metric: "val_f1"
+  resume: false
+
+evaluation:
+  metrics: ["accuracy", "precision", "recall", "f1", "roc_auc", "eer", "confusion_matrix"]
+  threshold: 0.5
+
+explainability:
+  method: "gradcam"
+  target_layer: "backbone.conv_head"
+  overlay_alpha: 0.5
+  colormap: "jet"
+
+deployment:
+  host: "0.0.0.0"
+  port: 5000
+  debug: false
+  max_upload_size_mb: 25
+  allowed_extensions: [".wav"]
+  model_checkpoint: "checkpoints/smoke_seaspoof_paired/best_model.pt"

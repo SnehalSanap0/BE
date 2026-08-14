@@ -21,12 +21,14 @@ Expected raw layout:
 
 from __future__ import annotations
 
+import csv
 import uuid
 from pathlib import Path
 
 import soundfile as sf
 
 from configs.config import CONFIG
+from preprocessing.hf_ingestion import PAIR_TRANSCRIPTS_FILENAME
 from utils.logger import get_logger
 from utils.metadata_manager import MetadataManager
 
@@ -115,6 +117,30 @@ def _infer_speaker(filepath: Path, raw_dir: Path, valid_labels: tuple[str, ...],
     return "unknown"
 
 
+def _load_pair_transcripts(language_dir: Path) -> dict[str, str]:
+    """Load one language directory's ``pair_transcripts.csv`` sidecar, if present.
+
+    Written by :func:`preprocessing.hf_ingestion.ingest_paired_sources` for
+    transcript-paired sources (e.g. SEA-Spoof); absent entirely for
+    non-paired sources, which simply get an empty ``transcript`` field.
+
+    Args:
+        language_dir: ``raw_dir / language`` directory to look for the
+            sidecar file in.
+
+    Returns:
+        Mapping of filename (basename, e.g. ``real_sea_001500.flac``) to its
+        transcript. Empty if no sidecar file exists for this language.
+    """
+    sidecar_path = language_dir / PAIR_TRANSCRIPTS_FILENAME
+    if not sidecar_path.exists():
+        return {}
+
+    with sidecar_path.open("r", newline="", encoding="utf-8") as file_handle:
+        reader = csv.DictReader(file_handle)
+        return {row["filename"]: row["transcript"] for row in reader}
+
+
 def _probe_audio(filepath: Path) -> tuple[int, float] | None:
     """Read sample rate and duration from a file's header without full decode.
 
@@ -162,6 +188,7 @@ def build_initial_metadata(metadata_manager: MetadataManager | None = None) -> M
 
     new_records: list[dict[str, object]] = []
     skipped_unlabeled = 0
+    transcript_cache: dict[Path, dict[str, str]] = {}
 
     for filepath in discovered_files:
         audio_id = uuid.uuid5(uuid.NAMESPACE_URL, str(filepath)).hex
@@ -178,13 +205,20 @@ def build_initial_metadata(metadata_manager: MetadataManager | None = None) -> M
         probe_result = _probe_audio(filepath)
         sample_rate, duration = probe_result if probe_result is not None else (0, 0.0)
 
+        language = _infer_language(filepath, raw_dir, CONFIG.dataset.languages)
+        language_dir = raw_dir / language
+        if language_dir not in transcript_cache:
+            transcript_cache[language_dir] = _load_pair_transcripts(language_dir)
+        transcript = transcript_cache[language_dir].get(filepath.name, "")
+
         new_records.append(
             {
                 "audio_id": audio_id,
                 "filepath": str(filepath),
                 "label": label,
                 "speaker": _infer_speaker(filepath, raw_dir, CONFIG.dataset.labels, CONFIG.dataset.languages),
-                "language": _infer_language(filepath, raw_dir, CONFIG.dataset.languages),
+                "language": language,
+                "transcript": transcript,
                 "sample_rate": sample_rate,
                 "duration": duration,
             }

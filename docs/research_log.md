@@ -4,6 +4,42 @@ Running, crisp record of design decisions, bugs found, and experiment results �
 
 ---
 
+## Accuracy vs. configuration (paired SEA-Spoof smoke tracker)
+
+> **Protocol correction (2026-08-09):** entries below that predate the
+> leakage-safe rerun used label-stratified row splitting, which could place
+> clips sharing a transcript in different partitions. They are development
+> results, not citable estimates. The surviving 500-pair manifest contained
+> 164 transcript groups spanning splits.
+
+Quick-reference table for how accuracy/EER move as `target_count` (paired clips) and
+other `configs/config.smoke_seaspoof.yaml` knobs change, pulled out of the narrative
+entries below so trends are visible without re-reading prose each time. **Append new
+smoke-run rows here** (bottom of table) instead of only writing a prose entry —
+values not printed by a given run are left as "—", not guessed.
+
+| Date | Pairs (`target_count`) | Split | Shard order | Epochs | Batch size | Test clips | Accuracy | Precision | Recall | F1 | ROC-AUC | EER | Notes |
+|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 2026-08-06 | 12 | validation | default | 2 | — | 4 | — | — | — | — | — | — | Model collapsed to predicting one class; 4-clip test set too small for metrics to mean anything. |
+| 2026-08-06 | 100 | validation | default | — (more than smoke test above) | — | 30 | 0.8333 | — | — | 0.8387 | 0.9156 | 0.2333 | Stopped collapsing once epochs/pretraining increased. |
+| 2026-08-06 | 500 | validation | default | 15 | 32 | — | — | — | — | — | — | — | Numbers only in `outputs/smoke_seaspoof_paired/smoke_test_metrics.json` at the time, not copied into the log. |
+| 2026-08-06 | 1000 | validation | default | — | — | 149 real + 149 fake (approx.) | 0.9866 | 1.0000 | 0.9732 | 0.9864 | 1.0000 | 0.0000 | Final 1000-pair checkpoint; confusion matrix 149/149 real correct, 145/149 fake correct. `eer_threshold=0.0735`. |
+| 2026-08-06 | ~1000 (same run as above, later eval) | validation | default | — | — | 150 (69+6+1+74) | 0.9533 | 0.9250 | 0.9867 | 0.9548 | 0.9964 | 0.0400 | `eer_threshold=0.5403`. Logged separately from the row above in the original entry; not clearly distinguished whether this is a rerun or a different eval pass — flagged for cleanup. |
+| 2026-08-09 | 12 | validation | **reversed** (`SEA_SPOOF_SHARD_REVERSE=1`) | 10 (config default; early-stopping patience=2) | 16 | 4 (2 real + 2 fake) | 0.5000 | 0.5000 | 0.5000 | 0.5000 | 0.7500 | 0.5000 | `eer_threshold=0.5194`. Confusion matrix `[[1,1],[1,1]]` — chance-level at 4 test clips, consistent with the 2026-08-06/12-pair row above: 12 pairs is too small a smoke scale for meaningful metrics regardless of shard order. ROC-AUC (0.75) above chance suggests some ranking signal despite accuracy being exactly chance. |
+| 2026-08-09 | 24 | validation | default | 10 (config default; early-stopping patience=2) | 16 | 8 (4 real + 4 fake) | 0.7500 | 1.0000 | 0.5000 | 0.6667 | 0.7500 | 0.5000 | `eer_threshold=0.4444`. Confusion matrix `[[4,0],[2,2]]` — all 4 real clips correctly classified, but only 2/4 fake clips caught (2 fake misclassified as real). Precision=1.0 but recall=0.5 for fake: at this tiny scale the model is defaulting toward predicting "real" rather than learning a balanced boundary. Still too few test clips (8) to trust as a real result — same caveat as the row above. |
+| 2026-08-09 | 250 | validation | default | 10 (config default; early-stopping patience=2, triggered after epoch 7) | 32 | 30 (15 real + 15 fake) | 0.8333 | 0.8571 | 0.8000 | 0.8276 | 0.9467 | 0.2000 | `eer_threshold=0.4136`. Best checkpoint at epoch 4 (`val_f1=0.8276`), reloaded after early stopping. Confusion matrix `[[13,2],[3,12]]` — 13/15 real correct, 12/15 fake correct. First mid-scale (250-pair) run in this tracker; between the noisy <30-pair rows above and the 1000-pair rows below, roughly consistent with the trend of improving/stabilizing metrics as pair count grows. |
+| 2026-08-09 | 250 (config unchanged from row above) | validation | default | 10 (config default; early-stopping patience=2, triggered after epoch 6) | 32 | 76 (38 real + 38 fake) | 0.9079 | 0.9189 | 0.8947 | 0.9067 | 0.9820 | 0.1053 | `eer_threshold=0.4509`. Best checkpoint at epoch 3 (`val_f1=0.9474`), reloaded after early stopping. Confusion matrix `[[35,3],[4,34]]` — 35/38 real correct, 34/38 fake correct. Same `target_count: 250` as the row above but a notably larger test split (76 vs 30 clips) and much better metrics — `target_count` is a per-source cap, not a guaranteed exact pair count, so shard-matching luck on this run apparently found more matched pairs; flagged since it makes the two "250" rows not directly comparable. |
+| 2026-08-09 | 500 | validation | default | 10 (config default; early-stopping patience=2, triggered after epoch 6) | 32 | 150 (75 real + 75 fake) | 0.9867 | 1.0000 | 0.9733 | 0.9865 | 1.0000 | 0.0000 | `eer_threshold=0.0610`. Best checkpoint at epoch 3 (`val_f1=0.9737`), reloaded after early stopping. Confusion matrix `[[75,0],[2,73]]` — all 75 real clips correct, 73/75 fake correct. `target_count` raised to 500 for this run (up from 250 in the two rows above); best metrics in the table so far, consistent with the tracker's overall trend of improving/stabilizing metrics as pair count grows. |
+
+**Reading this table:** accuracy is noisy and near-meaningless below roughly 100 paired
+clips (4-12 test clips flips between "collapses to one class" and "exactly 50/50" runs
+depending on which 2-4 clips land in the test split) — 1000 pairs is the first scale
+in this tracker with a test set large enough (150 clips) for the metrics to be
+stable/trustworthy. Treat any smoke-run number below that scale as a pipeline sanity
+check, not an accuracy result.
+
+---
+
 ### 2026-07-20 — Multi-source ingestion design
 Switched ingestion from one dataset per class to **multiple independent sources per class**:
 - `real`: Kathbath (3000) + Common Voice Hindi male (750) + Common Voice Hindi female (750)
@@ -153,3 +189,182 @@ To test the shortcut-learning hypothesis directly rather than only via proxy sig
 - `main` (pooled random split, the "suspiciously perfect" EER=0.0000 model from 2026-07-23) has the *lowest* shortcut_ratio of all five and by far the highest label-silhouette (0.4608) — consistent with that model having no incentive to be source-invariant (it saw every source in training) and instead learning a representation that separates label very cleanly *for sources it has seen*, which is exactly why its pooled metrics were misleadingly perfect but say nothing about unseen-source generalization.
 - **Open question from 2026-07-24 (factorial entry) substantially answered:** the mechanism is a genuine interaction between recording-channel silence/padding statistics (confound audit above) and the resulting embedding-space geometry (this entry) — SEA-Spoof's higher internal heterogeneity in silence statistics appears to prevent the model from cleanly separating it from Kathbath along the real/fake axis, collapsing much of that axis into a source-identity axis instead. Still not fully isolated to a single root cause (would need a controlled intervention, e.g. loudness/silence-normalizing all sources before training and re-running the factorial, to move from correlational to causal evidence) — noted as future work.
 - **For the paper:** this embedding diagnostic plus the confound audit together upgrade the factorial's finding from "generalization varies by source pairing" (observed) to "generalization varies with how much the embedding space conflates source identity with label, which itself tracks measurable channel-level heterogeneity in the training sources" (partially explained) — a stronger claim, with the causal intervention flagged as the natural next experiment rather than a gap.
+
+---
+
+### 2026-08-06 - Paired Hindi SEA-Spoof smoke pipeline
+
+Added a separate smoke-test path for paired Hindi SEA-Spoof bonafide/spoof examples:
+- Config: `configs/config.smoke_seaspoof.yaml`
+- Runner: `scripts/run_paired_seaspoof_smoke.py`
+- Artifact roots: `data/smoke_seaspoof_paired/`, `checkpoints/smoke_seaspoof_paired/`, `logs/smoke_seaspoof_paired/`, `outputs/smoke_seaspoof_paired/`
+
+**Why:** the immediate test was whether the model can train on transcript-matched Hindi real/spoof pairs so content/transcript is less likely to define the label. SEA-Spoof is the better immediate dataset than MHDDV for this repo because `preprocessing.hf_ingestion.ingest_paired_sources` already pairs SEA-Spoof bonafide/spoof rows by transcript (`text`) and writes matched `real_sea_000000.*` / `fake_sea_000000.*` files.
+
+**Implementation notes:**
+- `configs.config` now supports `DEEPFAKE_CONFIG_PATH`, so the smoke run can use an isolated config without editing the main `configs/config.yaml`.
+- SEA-Spoof `train` shards were too large and ordered poorly for a quick test; smoke config uses `split: validation`, which contained enough Hindi bonafide/spoof transcript matches in `validation-00000.parquet`.
+- Added optional shard scan controls for future quick tests: `SEA_SPOOF_SHARD_REVERSE=1` and `SEA_SPOOF_SHARD_START_INDEX=N`.
+- Fixed a PyArrow crash in the second audio-fetch pass (`ArrowNotImplementedError: Nested data conversions not implemented for chunked array outputs`) by reading the nested `audio` struct row-group-wise instead of via `iter_batches`.
+
+**Smoke progression:**
+- 12 pairs, 2 epochs: pipeline completed, but the model collapsed to predicting one class; test set was only 4 clips, so metrics were not meaningful.
+- 100 pairs, pretrained EfficientNet, more epochs: model stopped collapsing and reached `accuracy=0.8333`, `f1=0.8387`, `roc_auc=0.9156`, `eer=0.2333` on a 30-clip test set.
+- 500 pairs, pretrained EfficientNet-B0, batch size 32, 15 epochs: latest saved smoke metrics in `outputs/smoke_seaspoof_paired/smoke_test_metrics.json`.
+- Final 1000-pair checkpoint model: `accuracy=0.9866`, `precision=1.0000`, `recall=0.9732`, `f1=0.9864`, `roc_auc=1.0000`, `eer=0.0000`, `eer_threshold=0.0735`. Confusion matrix: 149/149 real correctly classified, 145/149 fake correctly classified, 4 fake clips missed as real.
+- Attempting to scale validation smoke ingestion to 1500 pairs was inefficient: after 1000 existing pairs, `validation-00000.parquet` found only 261 additional matched keys and `validation-00001.parquet` found 0, while each shard download is multi-GB. Conclusion: SEA-Spoof validation is enough for smoke/Gradio testing, but chasing larger paired counts through validation shards is not a good training-data strategy.
+
+| metric | value |
+|---|---:|
+| accuracy | 0.9533 |
+| precision | 0.9250 |
+| recall | 0.9867 |
+| f1 | 0.9548 |
+| roc_auc | 0.9964 |
+| eer | 0.0400 |
+| eer_threshold | 0.5403 |
+
+Confusion matrix:
+
+| actual \ predicted | real | fake |
+|---|---:|---:|
+| real | 69 | 6 |
+| fake | 1 | 74 |
+
+**Interpretation:** this is a successful paired same-source pipeline check, not cross-source evidence. The model can learn a strong decision boundary on transcript-paired SEA-Spoof validation examples, and the end-to-end GPU path is working. Because train/val/test all come from SEA-Spoof validation-derived paired examples, these metrics may still include SEA-Spoof-specific artifacts and should not replace the cross-source factorial as the generalization result.
+
+**Code note:** the `preprocessing/hf_ingestion.py` row-group audio read is required for SEA-Spoof paired ingestion because PyArrow failed on nested `audio` batch conversion. The shard-order environment controls are not required for correctness; they are a convenience for avoiding badly ordered shards during quick smoke runs.
+
+---
+
+### 2026-08-06 - Paired spectrogram viewer for real/spoof inspection
+
+Added `scripts/plot_paired_spectrograms.py` to render extracted `.npy` feature maps for matched SEA-Spoof pairs.
+
+**Why:** if `real_sea_000042.wav` and `fake_sea_000042.wav` share the same transcript, comparing their extracted mel-spectrogram arrays helps inspect what EfficientNet is likely seeing. The third panel (`spoof - real`) highlights visible differences such as high-frequency texture, silence/padding, energy distribution, or preprocessing artifacts.
+
+**Usage:**
+
+```powershell
+python -m scripts.plot_paired_spectrograms --limit 10
+python -m scripts.plot_paired_spectrograms --pair-id 000042
+```
+
+Outputs are written to `outputs/smoke_seaspoof_paired/paired_spectrograms/`.
+
+**Methodological use:** these plots are qualitative diagnostics. If visible differences are dominated by padding/silence or other channel-level cues rather than speech-region spoof artifacts, that suggests the next controlled experiment should normalize or crop speech-active regions before retraining.
+
+---
+
+### 2026-08-09 — Publication-scale paired run and external evaluation
+
+Completed the leakage-safe SEA-Spoof `train` experiment with 3,000 matched
+transcript pairs (6,000 clips). Audit: 3,000 unique transcripts, 0 missing
+transcripts, 0 cross-split transcripts, 0 incomplete groups, 0 duplicate
+paths, and 0 missing features. Each run used 4,800/600/600
+train/validation/test clips. Three independent model seeds completed: 42,
+1337, and 2026. Same-corpus test accuracy ranged from 0.9950 to 1.0000.
+
+Each model was evaluated on three deterministic external manifests of 100
+clips per source (Kathbath, Common Voice male, Common Voice female,
+IndicSynth). Mean ± SD across the three independently trained models:
+
+| Metric | Mean ± training-seed SD |
+|---|---:|
+| Accuracy | 0.8422 ± 0.0193 |
+| Balanced accuracy | 0.8907 ± 0.0115 |
+| F1 | 0.7586 ± 0.0217 |
+| ROC-AUC | 0.9501 ± 0.0205 |
+| EER | 0.1098 ± 0.0369 |
+| MCC | 0.6914 ± 0.0264 |
+
+Mean source accuracies were Kathbath 0.3944, Common Voice male 1.0000,
+Common Voice female 0.9867, and IndicSynth 0.9878. The residual domain gap
+is therefore concentrated on Kathbath genuine speech. This is a completed E2
+result, not yet evidence that pairing caused an improvement: an identically
+evaluated, count-matched non-paired E1 control remains required.
+
+---
+
+### 2026-08-09 — Transcript-leakage correction and clean 500-pair rerun
+
+The new `scripts/audit_experiment_protocol.py` found 164 transcript groups
+spanning train/validation/test in the prior 500-pair manifest. Class-wise row
+stratification had split paired real and spoof rows independently. Earlier
+paired-smoke scores are exploratory and must not be cited as unbiased
+generalization estimates.
+
+After transcript-grouped reassignment, the audit reports 250 transcript
+groups, 0 cross-split transcripts, 0 incomplete groups, and 678/166/156
+train/validation/test rows with balanced labels. The corrected single run
+obtained accuracy 0.9295, precision 0.9136, recall 0.9487, F1 0.9308,
+ROC-AUC 0.9911, and EER 0.0513; confusion matrix `[[71,7],[4,74]]`.
+This supersedes the leaked 0.9867 accuracy / 0.0000 EER result, but remains a
+same-source, single-run smoke result rather than the paper's main evidence.
+
+The corrected checkpoint's 15-per-source diagnostic at seed 42 obtained
+0.8167 overall: Kathbath 0.6000, CV male 0.7333, CV female 0.9333, and
+IndicSynth 1.0000. This remains exploratory sampling.
+
+---
+
+### 2026-08-09 — Smoke checkpoint spot-checked against the four earlier (unseen) sources
+
+Added `scripts/eval_smoke_model_on_legacy_sources.py`: no retraining, just loads the `target_count: 500` SEA-Spoof-paired smoke checkpoint (`checkpoints/smoke_seaspoof_paired/best_model.pt`, the 0.9867-accuracy run logged above) and runs it on random raw clips from the four sources it has never seen — Kathbath (`real`), Common Voice Hindi male/female (`real_cv_m`/`real_cv_f`), IndicSynth (`fake`) — sampled directly from `data/raw/hindi/`.
+
+**Run:** `--samples-per-source 15 --seed 42`.
+
+| source | true label | accuracy |
+|---|---|---:|
+| real (Kathbath) | real | 0.6000 |
+| real_cv_m (CV male) | real | 0.8667 |
+| real_cv_f (CV female) | real | 1.0000 |
+| fake (IndicSynth) | fake | 0.9333 |
+
+Overall accuracy: 0.8500 (51/60). Confusion: 37 real→real, 8 real→fake, 14 fake→fake, 1 fake→real.
+
+**Interpretation:** this is a single-seed, 60-clip spot check, not a paper-grade result — but it's informative as a first signal. The model, trained only on transcript-paired SEA-Spoof, clears well above chance on all four completely unseen sources, including the unseen fake source (IndicSynth, a different TTS system than SEA-Spoof's), which is a better sign than the earlier pooled-split/factorial work found for cross-source fake generalization. The weak point is Kathbath (0.60, 8/20 misclassified as fake) — worth checking against the confound-audit findings (`scripts/confound_check.py`) for whether Kathbath's channel/silence statistics differ enough from SEA-Spoof's training distribution to explain the miss, before concluding the model has learned genuine source-invariant spoof cues. **Next step:** run this through the proper `scripts/cross_source_holdout_check.py` protocol (fixed splits, multiple seeds) before this becomes a citable generalization claim.
+
+---
+
+### 2026-08-12 — E1 non-paired control: completed, and the causal pairing comparison
+
+Ran the E1 control the paper draft's §5.2 experiment matrix had flagged as the missing piece needed to claim transcript pairing itself (not just sample count or pipeline differences) drives the E2 cross-source result.
+
+**Method.** `configs/config.paper_seaspoof_e1.yaml` — identical to E2's `configs/config.paper_seaspoof.yaml` (same SEA-Spoof sources, `target_count: 3000` for both `real_sea`/`fake_sea`, same EfficientNet-B0 architecture, same AdamW/cosine/50-epoch/patience-7 training budget — see `docs/paper_draft.md` §5.0 for the shared configuration table), differing only in a new `ingestion.allow_pairing: false` flag. When false, `preprocessing/hf_ingestion.ingest_all()` no longer routes matching real/fake sources through `ingest_paired_sources` (transcript matching); real and fake clips are sampled independently up to their own `target_count`, and `scripts/run_nonpaired_seaspoof_experiment.py` assigns splits with ordinary label-stratified `dataset.split_assigner.assign_splits` instead of `assign_grouped_splits` — there is no transcript column to group by. Three independent training seeds: 42, 1337, 2026, matching E2.
+
+**Engineering note:** the first implementation routed the non-paired real/fake sources through the existing `ingest_source` (HF `streaming=True`) path, since it was the only path available for non-paired sources. Because `real_sea`/`fake_sea` are the same underlying dataset/split, this independently re-streamed the same shard bytes twice (once per label) via slow serial byte-range HTTP requests — observably far slower than E2's ingestion, which downloads each shard once via `_download_shard` (`hf_hub_download`, cache-aware) and reads it locally with pyarrow. Added `ingest_cosourced_independent()` to reuse the same single-download-per-shard path as `ingest_paired_sources`, just bucketing rows by label independently instead of matching transcripts. `ingest_all()` now dispatches: `allow_pairing=True` → `ingest_paired_sources`; same-dataset sources with `allow_pairing=False` → `ingest_cosourced_independent`; genuinely separate-dataset sources (Kathbath, Common Voice, IndicSynth) → unchanged `ingest_source` per source. Verified by mocking all three ingestion functions and checking dispatch for the E1, E2, and main configs.
+
+**Same-corpus (in-domain) results**, 600-clip held-out SEA-Spoof test split per seed (ordinary stratified, not transcript-grouped):
+
+| Seed | Accuracy | F1 | ROC-AUC | EER |
+|---:|---:|---:|---:|---:|
+| 42 | 1.0000 | 1.0000 | 1.0000 | 0.0000 |
+| 1337 | 1.0000 | 1.0000 | 1.0000 | 0.0000 |
+| 2026 | 1.0000 | 1.0000 | 1.0000 | 0.0000 |
+
+All three seeds hit exact 1.0 accuracy (confusion matrix `[[300,0],[0,300]]` every time) — even more perfectly separable in-domain than E2's paired runs (0.9950–1.0000). This confirms same-corpus SEA-Spoof real/fake separability does not depend on transcript pairing at all; channel/vocoder-level cues alone are sufficient in-domain. The pairing effect, if any, can only show up cross-source.
+
+**Cross-source results**, evaluated with `scripts/evaluate_cross_source_protocol.py` against the identical external manifests E2 used (Kathbath, Common Voice male/female, IndicSynth; 100 clips/source, sampling seeds 42/1337/2026 per trained model):
+
+| Training seed | Accuracy | Balanced acc. | F1 | ROC-AUC | EER | MCC |
+|---:|---:|---:|---:|---:|---:|---:|
+| 42 | 0.7525 | 0.5050 | 0.0197 | 0.9655 | 0.0939 | 0.0698 |
+| 1337 | 0.7542 | 0.5106 | 0.0449 | 0.8505 | 0.2344 | 0.1044 |
+| 2026 | 0.7675 | 0.5394 | 0.1513 | 0.8980 | 0.1717 | 0.2216 |
+| **Mean ± SD** | **0.7581 ± 0.0082** | **0.5183 ± 0.0185** | **0.0720 ± 0.0699** | **0.9047 ± 0.0578** | **0.1667 ± 0.0704** | **0.1319 ± 0.0795** |
+
+Per-source accuracy (mean across the three trained models' three sampling manifests each):
+
+| Source | Label | E1 (non-paired) mean acc. | E2 (paired) mean acc. |
+|---|---|---:|---:|
+| Kathbath | real | 0.9933 ± 0.0067 | 0.3944 |
+| Common Voice male | real | 1.0000 ± 0.0000 | 1.0000 |
+| Common Voice female | real | 1.0000 ± 0.0000 | 0.9867 |
+| IndicSynth | **fake** | **0.0389 ± 0.0391** | 0.9878 |
+
+**Interpretation — this resolves the paper's central deferred claim.** E1's balanced accuracy (0.5183 ± 0.0185) is chance level. Per-source numbers show why: without transcript pairing, the model achieves near-perfect accuracy on every unseen *real* source but catches only 3.89% of unseen spoof clips (IndicSynth) — it collapsed to predicting "real" almost universally on external data. F1 (0.072) and MCC (0.132) near zero confirm this isn't a calibration/threshold artifact like the earlier 2×2 factorial's "swapped"/"real_swap_only" rotations (where ROC-AUC partly survived a broken threshold) — ROC-AUC is comparatively higher here (0.9047) than the collapsed operating-point metrics, but the model never learned to recognize an unseen synthesis system as fake at any usable threshold in practice, and MCC/F1 make clear this is a near-total failure to transfer spoof-detection signal, not just a threshold problem.
+
+E2 (transcript-paired) fails differently and much less severely: it correctly flags 98.78% of unseen IndicSynth spoof clips — a completely different, unseen TTS system than SEA-Spoof — at the cost of misclassifying 60.56% of Kathbath real clips as fake (the channel/silence confound already characterized in the 2026-07-24 entries). Its balanced accuracy (0.8907 ± 0.0115) is far above chance and its MCC (0.6914 ± 0.0264) shows real, substantial transferable signal, not a coin flip.
+
+**Conclusion for the paper:** transcript pairing is not a minor content-control nicety — without it, the detector learns essentially nothing that transfers to an unseen synthesis system (E1: 3.89% fake-source recall externally). With it, the detector transfers to an unseen synthesis system convincingly (E2: 98.78%) while trading in a different, better-characterized weakness (Kathbath channel confound). This is the causal evidence `docs/paper_draft.md` §8 and §11's reproducibility checklist flagged as missing before any claim about pairing's benefit could be made. The E3/E4 normalization ablation (testing whether silence/loudness normalization fixes E2's Kathbath weakness specifically) remains the next open item.

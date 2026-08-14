@@ -30,6 +30,7 @@ METADATA_COLUMNS: tuple[str, ...] = (
     "label",
     "speaker",
     "language",
+    "transcript",
     "sample_rate",
     "duration",
     "split",
@@ -55,6 +56,7 @@ _DEFAULTS: dict[str, object] = {
     "processed_path": "",
     "feature_path": "",
     "speaker": "unknown",
+    "transcript": "",
     "split": "",
     "processed": False,
     "feature_extracted": False,
@@ -101,6 +103,7 @@ class MetadataManager:
                         "label": str,
                         "speaker": str,
                         "language": str,
+                        "transcript": str,
                         "split": str,
                     },
                     keep_default_na=False,
@@ -111,10 +114,17 @@ class MetadataManager:
                 return pd.DataFrame(columns=METADATA_COLUMNS)
 
             missing_columns = set(METADATA_COLUMNS) - set(df.columns)
-            if missing_columns:
+            missing_without_default = missing_columns - set(_DEFAULTS)
+            if missing_without_default:
                 raise ValueError(
-                    f"Metadata file {self.metadata_path} is missing required columns: {missing_columns}"
+                    f"Metadata file {self.metadata_path} is missing required columns: {missing_without_default}"
                 )
+            for column in missing_columns & set(_DEFAULTS):
+                logger.info(
+                    "Metadata file %s predates the '%s' column; backfilling default %r for %d existing row(s).",
+                    self.metadata_path, column, _DEFAULTS[column], len(df),
+                )
+                df[column] = _DEFAULTS[column]
 
             df["processed"] = df["processed"].apply(_to_bool)
             df["feature_extracted"] = df["feature_extracted"].apply(_to_bool)

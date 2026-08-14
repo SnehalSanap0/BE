@@ -16,6 +16,7 @@ Path handling:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,18 @@ ROOT_DIR: Path = Path(__file__).resolve().parents[1]
 # no-op if no .env file exists, which keeps this safe in CI/production
 # environments that inject real environment variables directly.
 load_dotenv(ROOT_DIR / ".env")
-DEFAULT_CONFIG_PATH: Path = Path(__file__).resolve().parent / "config.yaml"
+CONFIG_PATH_ENV_VAR = "DEEPFAKE_CONFIG_PATH"
+
+
+def _default_config_path() -> Path:
+    """Return the config file to load, allowing smoke runs to use an isolated config."""
+    override = os.environ.get(CONFIG_PATH_ENV_VAR)
+    if override:
+        return Path(override).expanduser().resolve()
+    return Path(__file__).resolve().parent / "config.yaml"
+
+
+DEFAULT_CONFIG_PATH: Path = _default_config_path()
 
 
 @dataclass(frozen=True)
@@ -148,6 +160,7 @@ class IngestionConfig:
     hf_token_env_var: str
     real: tuple[HFSourceConfig, ...]
     fake: tuple[HFSourceConfig, ...]
+    allow_pairing: bool = True
 
 
 @dataclass(frozen=True)
@@ -343,6 +356,7 @@ def load_config(config_path: Path | None = None) -> Config:
         hf_token_env_var=ingestion_raw["hf_token_env_var"],
         real=_hf_source_list(ingestion_raw["real"]),
         fake=_hf_source_list(ingestion_raw["fake"]),
+        allow_pairing=ingestion_raw.get("allow_pairing", True),
     )
 
     features_raw = raw["features"]
