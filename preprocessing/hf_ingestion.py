@@ -852,6 +852,158 @@ def ingest_cosourced_independent(
     }
 
 
+def ingest_wavefake_paired(
+    dataset: str,
+    split: str,
+    id_field: str,
+    audio_field: str,
+    real_value: str,
+    fake_values: tuple[str, ...],
+    target_pairs: int,
+    language: str,
+    raw_dir: Path,
+    hf_token: str | None,
+    real_tag: str = "real_wf",
+    fake_tag: str = "fake_wf",
+) -> dict[str, dict[str, int]]:
+    """Ingest WaveFake-style real/fake clips paired by shared utterance id.
+
+    Unlike SEA-Spoof (one bonafide row + one spoof row per transcript),
+    WaveFake exposes one real clip alongside *several* fake variants (one per
+    vocoder, ``fake_values``) sharing the same utterance id (``id_field``,
+    e.g. ``audio_id``). To keep pairing 1:1 -- so this project's existing
+    paired-training machinery (``pair_transcripts.csv`` sidecar,
+    :func:`dataset.split_assigner.assign_grouped_splits`) works unmodified --
+    each utterance id is deterministically assigned exactly one vocoder
+    (``hash(id) % len(fake_values)``), so across many utterances every
+    vocoder appears roughly equally often, but each individual written pair
+    is exactly one real clip + one fake clip sharing an id, exactly like a
+    SEA-Spoof pair.
+
+    Streamed in a single pass, unlike :func:`ingest_source`'s
+    one-restart-per-source approach: scanning once for whichever label each
+    row happens to carry is far cheaper here than restarting the HTTP stream
+    from the beginning once per vocoder (this dataset is not gated and
+    streams directly, unlike SEA-Spoof's Xet-only shards).
+
+    Args:
+        dataset: HuggingFace dataset repo id.
+        split: Split name.
+        id_field: Column giving the shared utterance id across real/fake rows.
+        audio_field: Column holding the audio bytes.
+        real_value: The label value (e.g. ``"R"``) identifying real rows.
+        fake_values: All possible fake label values (e.g. ``("WF1", ..., "WF7")``).
+        target_pairs: Number of matched real/fake pairs to ingest.
+        language: Language subdirectory to write clips under.
+        raw_dir: Root raw-data directory.
+        hf_token: HuggingFace access token, or ``None`` for ungated datasets.
+        real_tag: Filename prefix for real clips.
+        fake_tag: Filename prefix for fake clips.
+
+    Returns:
+        ``{real_tag: summary, fake_tag: summary}``, each a dict with
+        ``already_present``/``newly_written``/``skipped`` counts.
+    """
+    real_dir = raw_dir / language / "real"
+    fake_dir = raw_dir / language / "fake"
+    real_dir.mkdir(parents=True, exist_ok=True)
+    fake_dir.mkdir(parents=True, exist_ok=True)
+
+    existing_pairs = min(_existing_clip_count(real_dir, real_tag), _existing_clip_count(fake_dir, fake_tag))
+    remaining = max(0, target_pairs - existing_pairs)
+    if remaining == 0:
+        logger.info("Skipping WaveFake pairing (%s): already have %d/%d pair(s).", language, existing_pairs, target_pairs)
+        summary = {"already_present": existing_pairs, "newly_written": 0, "skipped": 0}
+        return {real_tag: summary, fake_tag: summary.copy()}
+
+    logger.info(
+        "Streaming %s (%s) for WaveFake-style pairing: need %d more pair(s), %d already present.",
+        dataset, split, remaining, existing_pairs,
+    )
+
+    hf_dataset = load_dataset(dataset, split=split, streaming=True, token=hf_token)
+    hf_dataset = hf_dataset.cast_column(audio_field, Audio(decode=False))
+
+    def _assigned_fake_value(utterance_id: str) -> str:
+        return fake_values[hash(utterance_id) % len(fake_values)]
+
+    pending: dict[str, dict[str, dict]] = {}
+    newly_written = 0
+    rows_seen = 0
+    skipped = 0
+    progress = tqdm(total=remaining, desc=f"{language}/paired/{real_tag}+{fake_tag}")
+
+    for row in hf_dataset:
+        if newly_written >= remaining:
+            break
+        rows_seen += 1
+
+        utterance_id = row.get(id_field)
+        label_value = row.get("real_or_fake")
+        if utterance_id is None or label_value is None:
+            skipped += 1
+            continue
+
+        utterance_key = str(utterance_id)
+        assigned_fake = _assigned_fake_value(utterance_key)
+        if label_value != real_value and label_value != assigned_fake:
+            continue  # Not this utterance's assigned vocoder -- skip without buffering.
+
+        audio_entry = row.get(audio_field)
+        if not audio_entry or not audio_entry.get("bytes"):
+            skipped += 1
+            continue
+
+        entry = pending.setdefault(utterance_key, {})
+        entry[label_value] = audio_entry
+
+        if real_value not in entry or assigned_fake not in entry:
+            continue
+
+        pair_index = existing_pairs + newly_written
+        real_path = real_dir / f"{real_tag}_{pair_index:06d}{_audio_extension(entry[real_value])}"
+        fake_path = fake_dir / f"{fake_tag}_{pair_index:06d}{_audio_extension(entry[assigned_fake])}"
+
+        try:
+            _write_audio_bytes(real_path, entry[real_value])
+            _write_audio_bytes(fake_path, entry[assigned_fake])
+        except OSError as exc:
+            logger.warning("Failed to write WaveFake pair %s / %s: %s", real_path, fake_path, exc)
+            real_path.unlink(missing_ok=True)
+            fake_path.unlink(missing_ok=True)
+            skipped += 1
+            pending.pop(utterance_key, None)
+            continue
+
+        # Flushed immediately (not batched to the end of the loop) so an
+        # interrupted run never leaves audio files on disk whose pairing
+        # can't be recovered -- an earlier batched version of this function
+        # lost 100 pairs' transcript records this way when the process was
+        # killed mid-run (see docs/research_log.md).
+        _append_pair_transcripts(raw_dir / language, [(real_path.name, utterance_key), (fake_path.name, utterance_key)])
+        newly_written += 1
+        progress.update(1)
+        pending.pop(utterance_key, None)
+
+    progress.close()
+
+    if newly_written < remaining:
+        logger.warning(
+            "Stream exhausted after scanning %d row(s): only found %d/%d WaveFake pair(s).",
+            rows_seen, newly_written, remaining,
+        )
+
+    logger.info(
+        "Finished WaveFake pairing %s/%s (%s): %d already present, %d newly written pair(s), "
+        "%d skipped, %d row(s) scanned.",
+        real_tag, fake_tag, language, existing_pairs, newly_written, skipped, rows_seen,
+    )
+
+    real_summary = {"already_present": existing_pairs, "newly_written": newly_written, "skipped": skipped}
+    fake_summary = real_summary.copy()
+    return {real_tag: real_summary, fake_tag: fake_summary}
+
+
 def ingest_all() -> dict[str, dict[str, int]]:
     """Ingest every real and fake source dataset per ``CONFIG.ingestion``.
 

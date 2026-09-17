@@ -368,3 +368,69 @@ Per-source accuracy (mean across the three trained models' three sampling manife
 E2 (transcript-paired) fails differently and much less severely: it correctly flags 98.78% of unseen IndicSynth spoof clips — a completely different, unseen TTS system than SEA-Spoof — at the cost of misclassifying 60.56% of Kathbath real clips as fake (the channel/silence confound already characterized in the 2026-07-24 entries). Its balanced accuracy (0.8907 ± 0.0115) is far above chance and its MCC (0.6914 ± 0.0264) shows real, substantial transferable signal, not a coin flip.
 
 **Conclusion for the paper:** transcript pairing is not a minor content-control nicety — without it, the detector learns essentially nothing that transfers to an unseen synthesis system (E1: 3.89% fake-source recall externally). With it, the detector transfers to an unseen synthesis system convincingly (E2: 98.78%) while trading in a different, better-characterized weakness (Kathbath channel confound). This is the causal evidence `docs/paper_draft.md` §8 and §11's reproducibility checklist flagged as missing before any claim about pairing's benefit could be made. The E3/E4 normalization ablation (testing whether silence/loudness normalization fixes E2's Kathbath weakness specifically) remains the next open item.
+
+---
+
+### 2026-09-17 — Grad-CAM UI: colorbar legend and peak-region caption
+
+For a live demo, a raw Grad-CAM heatmap asks the viewer to already know "warm color = high influence" and to eyeball time/frequency positions themselves. Added two pieces to close that gap:
+
+- `explainability.visualizer.render_colormap_legend`: a static colorbar image (same colormap as the overlay) labeled "High"/"Low influence," rendered once and shown alongside every Grad-CAM output in the Gradio demo.
+- `explainability.visualizer.describe_peak_region`: finds the highest-valued Grad-CAM pixels (top decile, floored to at least half the map's max) and maps their row/column position back to an approximate frequency band (mel scale, `CONFIG.features.fmin/fmax`) and time window (`CONFIG.audio.target_duration_seconds`), e.g. `"1.7-4.0 kHz, 0.41-3.34s"`. This is approximate — the spectrogram is resized to a square before the model sees it, so the mapping is proportional, not read off the original FFT bins — but sufficient to tell a non-technical viewer where to look without interpreting a heatmap by eye.
+
+Wired both into `ExplanationResult` (new `peak_region_caption` field, populated in `explain_audio_file`), into `deployment/gradio_app.py`'s UI (heatmap + legend side-by-side, plus a caption sentence naming the label, confidence, and driving region), and into the Flask API (`deployment/app.py`'s `/predict` response now includes `gradcam_peak_region`). Also added a one-click real/fake example-clip picker to the Gradio demo (`gr.Examples`, pointing at existing Hindi raw clips and, once ingested, English WaveFake clips) so a reviewer doesn't need their own audio file to try it.
+
+**Verification:** ran end-to-end against the existing `checkpoints/best_model.pt` (Hindi) on one real and one fake clip — both predicted correctly (confidence ~1.0 each) with visibly distinct peak regions (real: 0.0-0.9 kHz / 0.00-1.92s; fake: 1.7-4.0 kHz / 0.41-3.34s), consistent with the general expectation that synthetic-speech artifacts concentrate at different frequency bands than natural speech, though this is a two-clip spot check, not a systematic audit of what the model attends to across many clips.
+
+---
+
+### 2026-09-17 — English pipeline: WaveFake benchmark smoke run (in progress)
+
+First extension of the pipeline beyond Hindi. Added `configs/config.english_smoke.yaml` and `scripts/run_english_smoke.py`, reusing the existing generic (language-driven-by-config) ingestion/preprocessing/feature/training/eval pipeline unchanged — no pipeline code required a Hindi-specific assumption, confirming the "no hardcoded paths/languages" design principle held up under a real second-language test.
+
+**Dataset:** [WaveFake](https://arxiv.org/abs/2111.02813) (Frank & Schonherr, 2021) — real English speech from LJSpeech, fake speech from 7 distinct neural vocoders (WF1-WF7) — via the community HF parquet mirror `ajaykarthick/wavefake-audio` (not the official Zenodo-distributed release; chosen because it drops into the existing bounded-streaming ingestion path with zero new code, verified by test-streaming it directly before committing to it). Considered official ASVspoof2019 first, but its only HF mirror (`LanceaKing/asvspoof2019`) uses a legacy loading-script format the project's `datasets` library version can't load (the same class of problem that already forced the Common Voice Hindi source onto a Parquet mirror) and the official release would require a new download+protocol-parsing path — not attempted given the same-night deadline.
+
+**Design choice:** one `ingestion.fake` source per vocoder (WF1..WF7, 200 clips each) rather than one pooled fake filter, mirroring this project's existing multi-source-per-class philosophy (see 2026-07-20 entry) so the fake class isn't defined by a single synthesis system's artifacts. Real: 1400 LJSpeech clips.
+
+**Known limitation, not yet fixed:** WaveFake rows share an underlying LJSpeech utterance ID across the real clip and all 7 fake variants (confirmed directly: `real_or_fake="R"` and `"WF1".."WF7"` rows for the same `audio_id` carry the same transcript-adjacent content), but that ID is not threaded through the transcript-pairing sidecar this project built for SEA-Spoof (`pair_transcripts.csv` / `assign_grouped_splits`) — that mechanism was wired specifically for SEA-Spoof's `text` column. This run uses ordinary label-stratified splits (`dataset.split_assigner.assign_splits`), so same-utterance clips may land in different partitions. Given this project's own finding that pooled/ungrouped splits inflate same-corpus metrics (see 2026-07-23 entry), **any same-corpus accuracy from this run should be read the same way as that early pooled-split Hindi result: a pipeline/architecture sanity check, not a citable number**, until utterance-ID grouping is added the way transcript grouping was for SEA-Spoof.
+
+**Status at time of writing:** ingestion running (real-clip streaming ~50% complete); training/evaluation not yet finished. This entry will be updated with final same-corpus metrics once the run completes — recorded now, before the result is known, specifically so the "smoke test, not a result" framing above isn't written after seeing the number.
+
+---
+
+### 2026-09-18 — English pipeline: switched to transcript-paired ingestion (correcting the above)
+
+The unpaired approach above was stopped before preprocessing/training started, once it was clear it repeated exactly the same gap the SEA-Spoof pairing work already fixed for Hindi. Rather than accept that gap for a first English result, added `preprocessing.hf_ingestion.ingest_wavefake_paired`: pairs each real clip with exactly one fake vocoder variant sharing its `audio_id`, deterministically rotated across WF1-WF7 (`hash(audio_id) % 7`) so every vocoder is represented across the dataset while each individual pair stays 1:1 — the same shape as a SEA-Spoof `(real_sea_NNNNNN, fake_sea_NNNNNN)` pair, sharing the same `pair_transcripts.csv` sidecar mechanism and `assign_grouped_splits` protection, so a pair's real+fake clips can no longer land in different train/val/test partitions.
+
+Engineering note: this single-pass approach (stream once, keep whichever row matches either "R" or that utterance's assigned vocoder, discard the rest) also turned out to be more network-efficient than the original independent-per-source `ingest_source` calls, which each restarted the HF stream from row 0 once per source (8 separate full restarts for real + 7 vocoders) — the paired approach scans the stream exactly once.
+
+Verified against a 5-pair test run: `pair_transcripts.csv` showed exactly 5 matched `(real_wf_NNNNNN, fake_wf_NNNNNN)` pairs sharing identical `audio_id` transcript keys (e.g. `LJ001-0001`), 40 rows scanned total (5 pairs x 8 rows/utterance, as expected since the vocoder-matching filter still has to see every row for an utterance before it knows whether it matches).
+
+Updated `configs/config.english_smoke.yaml` to `target_count: 1000` pairs (1000 real + 1000 fake, matching the Hindi tracker's own historical judgment that 1000 pairs was "the first scale ... with a test set large enough ... for the metrics to be stable/trustworthy," see the smoke-tracker table's note). `scripts/run_english_smoke.py` now calls `ingest_wavefake_paired` directly (bypassing `ingest_all()`, since the generic multi-source dispatch in `hf_ingestion.py` doesn't have a concept of "N fake variants per one real clip") and uses `assign_grouped_splits(group_column="transcript")` instead of the plain stratified `assign_splits`. Result pending -- see the next entry once the run completes.
+
+**Bug found and fixed mid-run:** the first version of `ingest_wavefake_paired` only wrote the `pair_transcripts.csv` sidecar once, at the very end of ingestion (batched, not incremental). An interrupted run left 100 pairs' audio files on disk with no recorded transcript link -- an unrecoverable pairing loss on crash, not just a resume inefficiency. Fixed by flushing the sidecar after every single pair. The 100 orphaned pairs were removed and the remaining 900 good pairs renumbered contiguously (0..899) before resuming ingestion to the 1000-pair target, to avoid the renumbered/orphan-deleted state colliding with `existing_pairs`-based resume counting on the next run. `data/english_smoke/metadata`, `processed`, and `features` were cleared and rebuilt fresh afterward, since `preprocessing.metadata_builder` derives each row's `audio_id` (a UUID) from the raw filepath — renaming raw files invalidates all previously-derived IDs.
+
+---
+
+### 2026-09-18 — English pipeline: WaveFake same-corpus smoke result
+
+Completed run: 1000 transcript-paired real/fake clips (LJSpeech + WaveFake vocoders, rotated WF1-WF7), grouped 70/15/15 split (700/150/150 pairs -> 149/149 real/fake in the realized test split after grouping), EfficientNet-B0, 25-epoch budget with early stopping (patience 5, triggered after epoch 12, best checkpoint from epoch 7 reloaded for final eval), GPU (RTX 4050).
+
+**Test-split result:**
+
+| Metric | Value |
+|---|---:|
+| Accuracy | 1.0000 |
+| Balanced accuracy | 1.0000 |
+| Precision | 1.0000 |
+| Recall | 1.0000 |
+| F1 | 1.0000 |
+| MCC | 1.0000 |
+| ROC-AUC | 1.0000 |
+| EER | 0.0000 |
+
+Confusion matrix: 149/149 real correct, 149/149 fake correct (`eer_threshold=0.7735`).
+
+**Interpretation -- read this the same way the project's own E1 control and the very first pooled-split Hindi run (2026-07-23) were read, not as a generalization result:** a perfect same-corpus score here is expected, not surprising. WaveFake's 7 vocoders leave distinctive channel/synthesis artifacts that a CNN can separate cleanly when train and test are drawn from the same corpus, transcript-paired or not -- this project's own E1 non-paired control hit an identical 1.0/1.0/1.0/0.0 in-domain on SEA-Spoof (see 2026-08-12 entry) despite later failing almost completely cross-source (3.89% fake recall on unseen data). This English number demonstrates the pipeline, ingestion, pairing, and training loop all work correctly end-to-end on a second language and a second benchmark -- it is not evidence the model would detect an unseen English TTS/vocoder system, which is exactly the question the Hindi cross-source factorial exists to answer and which this run does not attempt.
+
+**What would be needed before this number means anything about generalization:** a second, disjoint English source (e.g. an ASVspoof2019/2021 LA subset, or a different vocoder set entirely) held out the way `scripts/cross_source_holdout_check.py` holds out Common Voice/SEA-Spoof from Kathbath/IndicSynth. Not attempted tonight given the deadline -- flagged here as the immediate next step before citing this pipeline's English result as anything beyond a working smoke test.

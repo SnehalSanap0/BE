@@ -1,0 +1,135 @@
+# Fast English smoke config: WaveFake benchmark (Frank & Schonherr, 2021),
+# via the community HF parquet mirror `ajaykarthick/wavefake-audio`
+# (LJSpeech real speech + 7 neural-vocoder fake variants: WF1-WF7).
+# Use via:
+#   $env:DEEPFAKE_CONFIG_PATH="configs/config.english_smoke.yaml"
+
+paths:
+  data_dir: "data/english_smoke"
+  raw_dir: "data/english_smoke/raw"
+  processed_dir: "data/english_smoke/processed"
+  feature_dir: "data/english_smoke/features"
+  metadata_dir: "data/english_smoke/metadata"
+  metadata_file: "data/english_smoke/metadata/metadata.csv"
+  log_dir: "logs/english_smoke"
+  checkpoint_dir: "checkpoints/english_smoke"
+  output_dir: "outputs/english_smoke"
+  explanation_dir: "outputs/english_smoke/explanations"
+
+audio:
+  sample_rate: 16000
+  mono: true
+  target_duration_seconds: 4
+  remove_silence: true
+  top_db: 30
+  normalize: true
+  pad_mode: "constant"
+  supported_formats: [".wav", ".flac", ".mp3", ".ogg"]
+
+dataset:
+  languages: ["english"]
+  labels: ["real", "fake"]
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+  random_seed: 42
+
+# WaveFake mirror is not pre-split by label: every row carries an `audio_id`
+# (shared across one real clip and its 7 fake vocoder variants for the same
+# underlying LJSpeech utterance) and a `real_or_fake` field, "R" for genuine
+# audio and "WF1".."WF7" for the vocoder variants.
+#
+# NOTE: this section is NOT read by scripts/run_english_smoke.py -- kept only
+# to satisfy Config's schema (real/fake must be non-empty lists) and to
+# document the source. The actual ingestion goes through
+# preprocessing.hf_ingestion.ingest_wavefake_paired (called directly by the
+# runner script), which pairs each real clip with exactly one fake variant
+# sharing its audio_id -- deterministically rotated across WF1-WF7 so every
+# vocoder is represented, while keeping true 1:1 pairing like SEA-Spoof's
+# ingest_paired_sources. This is what lets assign_grouped_splits keep a
+# pair's real+fake clips in the same split, the same leakage protection the
+# SEA-Spoof paired runs rely on (see docs/research_log.md).
+ingestion:
+  language: "english"
+  hf_token_env_var: "HF_TOKEN"
+  allow_pairing: true
+  real:
+    - dataset: "ajaykarthick/wavefake-audio"
+      config_name: null
+      split: "train"
+      label: "real"
+      audio_field: "audio"
+      target_count: 1000
+      source_tag: "real_wf"
+      filters:
+        - field: "real_or_fake"
+          value: "R"
+  fake:
+    - dataset: "ajaykarthick/wavefake-audio"
+      config_name: null
+      split: "train"
+      label: "fake"
+      audio_field: "audio"
+      target_count: 1000
+      source_tag: "fake_wf"
+      filters:
+        - field: "real_or_fake"
+          value: "WF1"
+
+features:
+  type: "mel_spectrogram"
+  n_mels: 128
+  n_mfcc: 40
+  n_lfcc: 40
+  n_fft: 1024
+  hop_length: 512
+  win_length: 1024
+  fmin: 0
+  fmax: 8000
+  power: 2.0
+  log_scale: true
+  image_size: 128
+
+model:
+  backbone: "efficientnet_b0"
+  pretrained: true
+  num_classes: 2
+  use_bilstm: false
+  lstm_hidden_size: 256
+  lstm_num_layers: 2
+  lstm_bidirectional: true
+  dropout: 0.3
+  freeze_backbone: false
+
+training:
+  batch_size: 32
+  num_epochs: 25
+  learning_rate: 0.0003
+  weight_decay: 0.00001
+  optimizer: "adamw"
+  scheduler: "cosine"
+  early_stopping_patience: 5
+  early_stopping_min_delta: 0.0001
+  mixed_precision: true
+  gradient_clip_norm: 5.0
+  num_workers: 2
+  checkpoint_metric: "val_f1"
+  resume: false
+
+evaluation:
+  metrics: ["accuracy", "precision", "recall", "f1", "roc_auc", "eer", "confusion_matrix"]
+  threshold: 0.5
+
+explainability:
+  method: "gradcam"
+  target_layer: "backbone.conv_head"
+  overlay_alpha: 0.5
+  colormap: "jet"
+
+deployment:
+  host: "0.0.0.0"
+  port: 5000
+  debug: false
+  max_upload_size_mb: 25
+  allowed_extensions: [".wav"]
+  model_checkpoint: "checkpoints/english_smoke/best_model.pt"

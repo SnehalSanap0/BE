@@ -26,7 +26,12 @@ logger = get_logger(__name__)
 class InferenceService:
     """Holds one loaded model in memory and predicts+explains audio files against it."""
 
-    def __init__(self, checkpoint_path: Path | None = None, device: torch.device | None = None) -> None:
+    def __init__(
+        self,
+        checkpoint_path: Path | None = None,
+        device: torch.device | None = None,
+        feature_image_size: int | None = None,
+    ) -> None:
         """Load the best checkpoint and construct the model, feature extractor and explainer.
 
         Args:
@@ -34,6 +39,14 @@ class InferenceService:
                 :class:`training.checkpoint.CheckpointManager`. Defaults to
                 ``CONFIG.paths.checkpoint_dir / "best_model.pt"``.
             device: Device to run inference on. Defaults to CUDA if available, else CPU.
+            feature_image_size: Override for the spatial size features are
+                resized to (see :class:`feature_extraction.extractor.FeatureExtractor`).
+                Defaults to ``CONFIG.features.image_size``. Needed when
+                serving a checkpoint trained under a different config than
+                the process-wide ``CONFIG`` singleton (e.g. a second
+                language's smoke config with a different ``image_size`,
+                since a checkpoint must be fed features shaped exactly as it
+                was trained on, and ``CONFIG`` is fixed per process).
 
         Raises:
             FileNotFoundError: If no checkpoint exists at the resolved path
@@ -51,7 +64,7 @@ class InferenceService:
         self.model.to(self.device)
         self.model.eval()
 
-        self.feature_extractor = FeatureExtractor()
+        self.feature_extractor = FeatureExtractor(image_size=feature_image_size)
         self.explainer = GradCAMExplainer(self.model)
 
         logger.info(

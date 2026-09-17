@@ -17,6 +17,7 @@ data/metadata/*.csv
 data/smoke_seaspoof_paired
 data/paper_seaspoof_paired
 data/paper_seaspoof_nonpaired
+data/english_smoke
 
 # Logs, checkpoints, outputs
 logs/

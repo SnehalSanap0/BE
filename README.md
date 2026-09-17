@@ -71,9 +71,11 @@ python -m explainability.explain --audio path\to\clip.wav
 #    gradcam_image_base64}.
 python -m deployment.app
 
-# 8b. Alternative: interactive Gradio demo (upload/record audio, see the
-#     prediction and Grad-CAM overlay in-browser). Wraps the same
-#     InferenceService as step 8, so predictions are identical.
+# 8b. Alternative: interactive Gradio demo (upload/record audio, or pick a
+#     bundled real/fake example clip). Shows the prediction, the Grad-CAM
+#     overlay with a colorbar legend, and a caption naming the specific
+#     time/frequency region that most influenced the prediction. Wraps the
+#     same InferenceService as step 8, so predictions are identical.
 python -m deployment.gradio_app
 ```
 
@@ -181,6 +183,19 @@ python -m scripts.eval_smoke_model_on_legacy_sources --samples-per-source 15
 ```
 
 Writes `outputs/smoke_seaspoof_paired/legacy_source_eval.json` (per-clip predictions, per-source accuracy, confusion counts). Pass `--seed` to change which random clips are sampled, or `--checkpoint` to point at a different checkpoint file.
+
+## English WaveFake smoke pipeline
+
+A first extension of the pipeline beyond Hindi, using the [WaveFake](https://arxiv.org/abs/2111.02813) benchmark (Frank & Schonherr, 2021) — real English speech from LJSpeech plus fakes from 7 distinct neural vocoders (WF1-WF7) — via the community HF parquet mirror [`ajaykarthick/wavefake-audio`](https://huggingface.co/datasets/ajaykarthick/wavefake-audio) (not the official WaveFake distribution, which is a Zenodo archive; this mirror was used because it drops into the existing streaming-ingestion pipeline with no new code).
+
+Ingestion is transcript-paired, like SEA-Spoof: `preprocessing.hf_ingestion.ingest_wavefake_paired` matches each real clip with exactly one fake vocoder variant sharing its underlying LJSpeech `audio_id` (deterministically rotated across WF1-WF7 so every vocoder is represented), writes both into the same `pair_transcripts.csv` sidecar SEA-Spoof pairing uses, and `scripts/run_english_smoke.py` assigns splits via `assign_grouped_splits(group_column="transcript")` — so a pair's real+fake clips can never land in different train/val/test partitions. Still a same-corpus smoke run, not a cross-source result (no second, unseen English corpus yet) — see `docs/research_log.md` for the full design rationale and results.
+
+```powershell
+$env:DEEPFAKE_CONFIG_PATH="configs/config.english_smoke.yaml"
+python -m scripts.run_english_smoke
+```
+
+Writes to dedicated `data/english_smoke/`, `checkpoints/english_smoke/`, `logs/english_smoke/`, and `outputs/english_smoke/` roots, same isolation pattern as the SEA-Spoof smoke config. Scale up by raising `target_count` per source in `configs/config.english_smoke.yaml`.
 
 ## Cross-source generalization check
 

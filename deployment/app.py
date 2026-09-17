@@ -104,6 +104,7 @@ def create_app(inference_service: InferenceService | None = None) -> Flask:
                 "predicted_label": result.predicted_label,
                 "confidence": result.confidence,
                 "gradcam_image_base64": gradcam_base64,
+                "gradcam_peak_region": result.peak_region_caption,
             }
         )
 

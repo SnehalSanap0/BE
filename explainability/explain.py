@@ -22,7 +22,7 @@ from torch import nn
 from configs.config import CONFIG
 from dataset.deepfake_dataset import INDEX_TO_LABEL
 from explainability.gradcam import GradCAMExplainer
-from explainability.visualizer import overlay_cam_on_feature, save_overlay
+from explainability.visualizer import describe_peak_region, overlay_cam_on_feature, render_feature_as_image, save_overlay
 from feature_extraction.extractor import FeatureExtractor
 from models.model_factory import build_model
 from preprocessing.transforms import preprocess_audio
@@ -40,14 +40,32 @@ class ExplanationResult:
     Attributes:
         predicted_label: ``"real"`` or ``"fake"``.
         confidence: Model's softmax probability for ``predicted_label``, in ``[0, 1]``.
+        processed_audio: The mono/resampled/silence-trimmed/normalized/padded
+            waveform actually fed to feature extraction (see
+            :func:`preprocessing.transforms.preprocess_audio`) -- shown ahead
+            of the spectrogram so a viewer can hear what preprocessing did to
+            their raw upload before the model ever sees it.
+        processed_sample_rate: Sample rate of ``processed_audio``, in Hz
+            (``CONFIG.audio.sample_rate``).
+        spectrogram_image: The plain input feature (e.g. mel-spectrogram) the
+            model was fed, rendered as a viewable ``uint8`` RGB array -- shown
+            alongside ``overlay_image`` so a viewer can compare input vs.
+            attention.
         overlay_image: The Grad-CAM heatmap overlay, ``uint8`` RGB array.
         output_path: Path the overlay image was saved to.
+        peak_region_caption: Human-readable time/frequency description of the
+            spectrogram region that most influenced ``predicted_label`` (see
+            :func:`explainability.visualizer.describe_peak_region`).
     """
 
     predicted_label: str
     confidence: float
+    processed_audio: np.ndarray
+    processed_sample_rate: int
+    spectrogram_image: np.ndarray
     overlay_image: np.ndarray
     output_path: Path
+    peak_region_caption: str
 
 
 def explain_audio_file(
@@ -99,7 +117,9 @@ def explain_audio_file(
     confidence = float(probabilities[0, predicted_index].item())
 
     grayscale_cam = explainer.generate(input_tensor, target_class=predicted_index)
+    spectrogram_image = render_feature_as_image(feature)
     overlay = overlay_cam_on_feature(feature, grayscale_cam)
+    peak_region_caption = describe_peak_region(grayscale_cam)
 
     output_dir = output_dir or CONFIG.paths.explanation_dir
     output_path = output_dir / f"{audio_path.stem}_gradcam.png"
@@ -107,18 +127,23 @@ def explain_audio_file(
 
     predicted_label = INDEX_TO_LABEL[predicted_index]
     logger.info(
-        "Explained %s: predicted='%s' confidence=%.4f -> %s",
+        "Explained %s: predicted='%s' confidence=%.4f peak_region='%s' -> %s",
         audio_path.name,
         predicted_label,
         confidence,
+        peak_region_caption,
         output_path,
     )
 
     return ExplanationResult(
         predicted_label=predicted_label,
         confidence=confidence,
+        processed_audio=processed_audio,
+        processed_sample_rate=CONFIG.audio.sample_rate,
+        spectrogram_image=spectrogram_image,
         overlay_image=overlay,
         output_path=output_path,
+        peak_region_caption=peak_region_caption,
     )
 
 

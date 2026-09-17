@@ -27,6 +27,10 @@ This project doesn't feed raw audio waveforms into the model — it converts eac
 
 Given the research log's finding that the pooled-split model likely partly relies on a channel/silence shortcut, Grad-CAM overlays are genuinely useful evidence here: if the heatmap on a "fake" prediction consistently lights up on trailing silence/padding regions rather than the speech itself, that's a red flag pointing at the same shortcut the confound analysis found statistically — two independent methods agreeing, which is much stronger evidence than either alone.
 
+## Turning the heatmap into a sentence: the peak-region caption
+
+A raw heatmap still asks the viewer to eyeball "which part is brightest" and translate that into time/frequency themselves. `explainability/visualizer.describe_peak_region` does that translation automatically: it finds the highest-valued pixels in the Grad-CAM map and converts their row/column position back into an approximate frequency band (via the mel scale, `CONFIG.features.fmin/fmax`) and time window (via `CONFIG.audio.target_duration_seconds`), producing a caption like `"1.7-4.0 kHz, 0.41-3.34s"`. This is approximate, not exact — the spectrogram is resized to a square before the model ever sees it, so the mapping back is proportional, not read off the original per-frame FFT bins — but it's precise enough to tell a viewer *where to look* without them having to interpret a colormap by eye. The Gradio demo (`deployment/gradio_app.py`) also renders a colorbar legend (`render_colormap_legend`) alongside the heatmap so "warm color = high influence" doesn't have to be assumed knowledge.
+
 ## Rational summary
 
 - **"How does Grad-CAM know what mattered?"** — it uses the gradient of the predicted class score with respect to the model's internal feature maps, weighting each spatial location by how much it influenced the final score, then overlays that as a heatmap. (You don't need calculus to explain this — "how much does nudging this region change the answer" is the whole intuition.)

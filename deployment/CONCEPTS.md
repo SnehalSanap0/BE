@@ -17,7 +17,7 @@ If inference preprocessed audio even slightly differently than training did, the
 Both `deployment/app.py` (Flask) and `deployment/gradio_app.py` (Gradio) wrap the exact same `InferenceService` — neither reimplements prediction logic, they just present it differently:
 
 - **Flask** exposes a raw HTTP JSON API (`POST /predict` with an audio file, returns `{predicted_label, confidence, gradcam_image_base64}`). This is meant to be called *by other software* — a frontend app, a script, another service — not used directly by a human.
-- **Gradio** provides an interactive web page a human can use directly in a browser (upload or record audio, immediately see the label, confidence, and Grad-CAM heatmap rendered as an image) — no HTTP client or JSON parsing needed. It's the right choice for a demo, a poster-session link, or letting a non-technical reviewer try the model themselves.
+- **Gradio** provides an interactive web page a human can use directly in a browser (upload or record audio, or pick a bundled real/fake example clip; immediately see the label, confidence, the Grad-CAM heatmap with a colorbar legend, and a caption naming the specific time/frequency region that drove the prediction) — no HTTP client or JSON parsing needed. It's the right choice for a demo, a poster-session link, or letting a non-technical reviewer try the model themselves without first knowing how to read a raw heatmap.
 
 Because both call the same `InferenceService`, a prediction made through the Flask API and the same clip run through Gradio will always agree — there's exactly one place the actual prediction logic lives.
 
