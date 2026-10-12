@@ -11,9 +11,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import soundfile as sf
 
 from configs.config import CONFIG
+from preprocessing.audio_loader import load_audio
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -103,10 +103,10 @@ class AudioValidator:
             return ValidationResult(is_valid=False, reason=f"Unsupported format: {filepath.suffix}")
 
         try:
-            audio, sample_rate = sf.read(str(filepath), dtype="float32", always_2d=False)
-        except Exception as exc:  # noqa: BLE001 - any backend failure means "corrupted/unreadable"
+            audio, sample_rate = load_audio(filepath)
+        except ValueError as exc:
             logger.warning("Validation failed for %s: unreadable (%s).", filepath, exc)
-            return ValidationResult(is_valid=False, reason=f"Unreadable or corrupted audio: {exc}")
+            return ValidationResult(is_valid=False, reason=str(exc))
 
         if audio.size == 0:
             logger.warning("Validation failed for %s: empty audio.", filepath)

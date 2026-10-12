@@ -29,7 +29,10 @@ def convert_to_mono(audio: np.ndarray) -> np.ndarray:
 
     Args:
         audio: Audio samples. Either 1-D ``(num_samples,)`` for mono, or
-            2-D ``(num_channels, num_samples)`` for multi-channel.
+            2-D multi-channel in either layout: ``(num_samples, num_channels)``
+            as returned by ``soundfile.read``, or ``(num_channels, num_samples)``
+            as returned by ``librosa.load(mono=False)``. The channel axis is
+            taken to be the shorter one.
 
     Returns:
         1-D mono audio array. Returned unchanged if already mono.
@@ -37,8 +40,9 @@ def convert_to_mono(audio: np.ndarray) -> np.ndarray:
     if audio.ndim == 1:
         return audio
 
-    mono_audio = np.mean(audio, axis=0)
-    logger.debug("Converted %d-channel audio to mono.", audio.shape[0])
+    channel_axis = 0 if audio.shape[0] < audio.shape[1] else 1
+    mono_audio = np.mean(audio, axis=channel_axis)
+    logger.debug("Converted %d-channel audio to mono.", audio.shape[channel_axis])
     return mono_audio
 
 

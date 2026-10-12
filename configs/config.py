@@ -246,6 +246,19 @@ class DeploymentConfig:
 
 
 @dataclass(frozen=True)
+class ForensicsConfig:
+    """Forensic-analysis parameters: report/custody-log locations and verdict thresholds."""
+
+    report_dir: Path
+    custody_log: Path
+    genuine_below: float
+    synthetic_above: float
+    validation_scores: Path
+    segment_hop_seconds: float
+    min_speech_fraction: float
+
+
+@dataclass(frozen=True)
 class Config:
     """Root configuration object aggregating every subsystem's settings."""
 
@@ -259,6 +272,7 @@ class Config:
     evaluation: EvaluationConfig
     explainability: ExplainabilityConfig
     deployment: DeploymentConfig
+    forensics: ForensicsConfig
     raw: dict[str, Any] = field(repr=False, default_factory=dict)
 
 
@@ -429,6 +443,30 @@ def load_config(config_path: Path | None = None) -> Config:
         model_checkpoint=_resolve_path(ROOT_DIR, deployment_raw["model_checkpoint"]),
     )
 
+    # Optional section: experiment configs predating forensic reporting omit it.
+    forensics_raw = raw.get("forensics", {})
+    forensics = ForensicsConfig(
+        report_dir=_resolve_path(ROOT_DIR, forensics_raw.get("report_dir", "outputs/forensic_reports")),
+        custody_log=_resolve_path(
+            ROOT_DIR, forensics_raw.get("custody_log", "outputs/forensic_reports/custody_log.jsonl")
+        ),
+        genuine_below=float(forensics_raw.get("genuine_below", 0.05)),
+        synthetic_above=float(forensics_raw.get("synthetic_above", 0.95)),
+        validation_scores=_resolve_path(
+            ROOT_DIR,
+            forensics_raw.get("validation_scores", "outputs/paper_seaspoof_paired/cross_source_seed_42.json"),
+        ),
+        segment_hop_seconds=float(forensics_raw.get("segment_hop_seconds", 2.0)),
+        min_speech_fraction=float(forensics_raw.get("min_speech_fraction", 0.25)),
+    )
+    if forensics.segment_hop_seconds <= 0:
+        raise ValueError("forensics.segment_hop_seconds must be positive.")
+    if not 0.0 <= forensics.genuine_below < forensics.synthetic_above <= 1.0:
+        raise ValueError(
+            "forensics thresholds must satisfy 0 <= genuine_below < synthetic_above <= 1, got "
+            f"{forensics.genuine_below} / {forensics.synthetic_above}."
+        )
+
     return Config(
         paths=paths,
         audio=audio,
@@ -440,6 +478,7 @@ def load_config(config_path: Path | None = None) -> Config:
         evaluation=evaluation,
         explainability=explainability,
         deployment=deployment,
+        forensics=forensics,
         raw=raw,
     )
 

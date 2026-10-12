@@ -15,7 +15,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import soundfile as sf
 import torch
 from torch import nn
 
@@ -25,6 +24,7 @@ from explainability.gradcam import GradCAMExplainer
 from explainability.visualizer import describe_peak_region, overlay_cam_on_feature, render_feature_as_image, save_overlay
 from feature_extraction.extractor import FeatureExtractor
 from models.model_factory import build_model
+from preprocessing.audio_loader import load_audio
 from preprocessing.transforms import preprocess_audio
 from preprocessing.validator import AudioValidator
 from training.checkpoint import BEST_CHECKPOINT_FILENAME, CheckpointManager
@@ -98,9 +98,49 @@ def explain_audio_file(
     """
     validation = AudioValidator().validate(audio_path)
     if not validation.is_valid:
-        raise ValueError(f"Invalid audio file '{audio_path}': {validation.reason}")
+        raise ValueError(f"Invalid audio file '{audio_path.name}': {validation.reason}")
 
-    raw_audio, sample_rate = sf.read(str(audio_path), dtype="float32", always_2d=False)
+    raw_audio, sample_rate = load_audio(audio_path)
+    return explain_waveform(
+        raw_audio,
+        sample_rate,
+        model=model,
+        device=device,
+        output_stem=audio_path.stem,
+        feature_extractor=feature_extractor,
+        explainer=explainer,
+        output_dir=output_dir,
+    )
+
+
+def explain_waveform(
+    raw_audio: np.ndarray,
+    sample_rate: int,
+    model: nn.Module,
+    device: torch.device,
+    output_stem: str,
+    feature_extractor: FeatureExtractor | None = None,
+    explainer: GradCAMExplainer | None = None,
+    output_dir: Path | None = None,
+) -> ExplanationResult:
+    """Preprocess, predict, and Grad-CAM-explain an in-memory waveform.
+
+    Used directly to explain one window of a longer recording (see
+    :mod:`forensics.segments`); :func:`explain_audio_file` wraps it for files.
+
+    Args:
+        raw_audio: Raw samples, mono or ``(frames, channels)``.
+        sample_rate: Sample rate of ``raw_audio``, in Hz.
+        model: A loaded classification model, on ``device``.
+        device: Device to run inference on.
+        output_stem: File-name stem for the saved overlay image.
+        feature_extractor: Feature extractor; defaults to a new :class:`FeatureExtractor`.
+        explainer: Grad-CAM explainer bound to ``model``; defaults to a new one.
+        output_dir: Overlay directory; defaults to ``CONFIG.paths.explanation_dir``.
+
+    Returns:
+        An :class:`ExplanationResult`.
+    """
     processed_audio = preprocess_audio(raw_audio, sample_rate)
 
     feature_extractor = feature_extractor or FeatureExtractor()
@@ -122,13 +162,13 @@ def explain_audio_file(
     peak_region_caption = describe_peak_region(grayscale_cam)
 
     output_dir = output_dir or CONFIG.paths.explanation_dir
-    output_path = output_dir / f"{audio_path.stem}_gradcam.png"
+    output_path = output_dir / f"{output_stem}_gradcam.png"
     save_overlay(overlay, output_path)
 
     predicted_label = INDEX_TO_LABEL[predicted_index]
     logger.info(
         "Explained %s: predicted='%s' confidence=%.4f peak_region='%s' -> %s",
-        audio_path.name,
+        output_stem,
         predicted_label,
         confidence,
         peak_region_caption,

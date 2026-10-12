@@ -28,7 +28,8 @@ audio:
   top_db: 30
   normalize: true
   pad_mode: "constant"
-  supported_formats: [".wav", ".flac", ".mp3", ".ogg"]
+  # .m4a/.aac/.amr/.3gp/.webm/.wma need ffmpeg on PATH (see preprocessing/audio_loader.py).
+  supported_formats: [".wav", ".flac", ".mp3", ".ogg", ".opus", ".m4a", ".aac", ".amr", ".3gp", ".webm", ".wma"]
 
 dataset:
   languages: ["hindi"]
@@ -134,5 +135,25 @@ deployment:
   port: 5000
   debug: false
   max_upload_size_mb: 25
-  allowed_extensions: [".wav"]
-  model_checkpoint: "checkpoints/best_model.pt"
+  allowed_extensions: [".wav", ".flac", ".mp3", ".ogg", ".opus", ".m4a", ".aac", ".amr", ".3gp", ".webm", ".wma"]
+  # Paper E2 (transcript-paired SEA-Spoof) model, seed 42 -- best cross-source
+  # balanced accuracy of the three seeds (0.904). Trained with image_size 224,
+  # matching features.image_size above. Not checkpoints/best_model.pt: that is
+  # the pooled-split model with the documented channel shortcut.
+  model_checkpoint: "checkpoints/paper_seaspoof_paired/seed_42/best_model.pt"
+
+forensics:
+  report_dir: "outputs/forensic_reports"
+  custody_log: "outputs/forensic_reports/custody_log.jsonl"
+  # Three-way verdict on the model's fake probability. Calibrated against the
+  # seed-42 cross-source clip scores below: at 0.05/0.95 no external spoof clip
+  # was called genuine; genuine-speech false alarms (all Kathbath) remain and
+  # are reported in every forensic report.
+  genuine_below: 0.05
+  synthetic_above: 0.95
+  validation_scores: "outputs/paper_seaspoof_paired/cross_source_seed_42.json"
+  # Long recordings are scored in overlapping windows of
+  # audio.target_duration_seconds (the model's training clip length).
+  segment_hop_seconds: 2.0
+  # Windows with less non-silent audio than this are skipped, not scored.
+  min_speech_fraction: 0.25

@@ -12,9 +12,9 @@ contrasting *where* the model looks on a genuine clip versus a synthetic one
 sharing the same content, not just explaining one clip in isolation.
 
 Two models, not one: this project has separate checkpoints per language
-(``checkpoints/best_model.pt`` for Hindi, ``checkpoints/english_smoke/best_model.pt``
-for English), trained under different configs (different ``features.image_size``
-in particular -- 224 vs 128). A checkpoint must be fed features shaped exactly
+(``checkpoints/paper_seaspoof_paired/seed_42/best_model.pt`` for Hindi,
+``checkpoints/english_smoke/best_model.pt`` for English), trained under
+different configs (different ``features.image_size`` in particular -- 224 vs 128). A checkpoint must be fed features shaped exactly
 as it was trained on, so this module keeps one :class:`InferenceService` per
 language and a language selector routes each "Analyze" to the right one --
 running an English clip through the Hindi model (or vice versa) silently
@@ -30,9 +30,13 @@ from pathlib import Path
 import gradio as gr
 import numpy as np
 
+from configs.config import CONFIG
 from dataset.deepfake_dataset import LABEL_TO_INDEX
 from deployment.inference_service import InferenceService
 from explainability.visualizer import render_colormap_legend
+from forensics.analyze import analyze_evidence, validated_error_rates
+from forensics.report import render_timeline_image
+from forensics.verdict import LIKELY_SYNTHETIC
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -56,19 +60,15 @@ _PAIRED_SOURCE_ROOTS: tuple[tuple[str, str, str], ...] = (
 #: Per-language model config: checkpoint path (relative to project root) and
 #: the image_size that checkpoint was trained with (see module docstring).
 #:
-#: NOTE: "Hindi" deliberately points at the smoke_seaspoof_paired checkpoint,
-#: not checkpoints/best_model.pt. best_model.pt is the project's original
-#: pooled multi-source model (Kathbath/Common Voice/IndicSynth/SEA-Spoof,
-#: pooled random split -- see docs/research_log.md's 2026-07-23 "suspiciously
-#: perfect" entry) with a documented asymmetric bias toward missing spoofed
-#: clips on sources it wasn't trained on. It was never trained on any
-#: transcript-paired data, so testing it against paired example clips (from
-#: smoke_seaspoof_paired or paper_seaspoof_paired) compares it to data it has
-#: no relationship to -- an apples-to-oranges mismatch, not evidence of a new
-#: bug, but misleading for a demo. smoke_seaspoof_paired/best_model.pt is
-#: trained on exactly the data its matching examples come from.
+#: NOTE: "Hindi" points at the paper's E2 transcript-paired model (seed 42,
+#: best cross-source balanced accuracy of the three seeds), not
+#: checkpoints/best_model.pt -- that is the original pooled-split model with
+#: the documented channel shortcut (docs/research_log.md, 2026-07-23) -- nor
+#: the 500-pair smoke checkpoint. The E2 model was trained on SEA-Spoof
+#: ``train``; the one-click examples come from the smoke run's SEA-Spoof
+#: ``validation`` split, so they are clips this model has never seen.
 _LANGUAGE_MODELS: dict[str, dict[str, object]] = {
-    "Hindi": {"checkpoint": "checkpoints/smoke_seaspoof_paired/best_model.pt", "image_size": 128},
+    "Hindi": {"checkpoint": "checkpoints/paper_seaspoof_paired/seed_42/best_model.pt", "image_size": 224},
     "English": {"checkpoint": "checkpoints/english_smoke/best_model.pt", "image_size": 128},
 }
 
@@ -163,6 +163,13 @@ def create_demo(services: dict[str, InferenceService] | None = None) -> gr.Block
             + ", ".join(str(cfg["checkpoint"]) for cfg in _LANGUAGE_MODELS.values())
         )
     language_choices = list(services)
+    # Forensic tab: the examiner must choose the model; there is deliberately no default, because
+    # running a recording through the wrong language's model silently produces meaningless scores.
+    forensic_choice_to_language = {
+        f"{language} - validated" if validated_error_rates(service) is not None
+        else f"{language} - experimental, NOT validated (no decisive verdict)": language
+        for language, service in services.items()
+    }
     legend_image = render_colormap_legend()
 
     def analyze_clip(language: str, audio_path: str | None) -> tuple:
@@ -200,6 +207,66 @@ def create_demo(services: dict[str, InferenceService] | None = None) -> gr.Block
             fake_label, fake_processed, fake_spec, fake_overlay, fake_caption,
         )
 
+    def run_forensic_analysis(model_choice: str | None, audio_path: str | None, case_id: str, examiner: str) -> tuple:
+        """Analyse one evidence clip, returning a verdict summary and the PDF/JSON reports."""
+        if model_choice is None:
+            raise gr.Error("Choose the model matching the recording's language first.")
+        if audio_path is None:
+            raise gr.Error("Upload an evidence audio file first.")
+        language = forensic_choice_to_language[model_choice]
+        service = services.get(language)
+        if service is None:
+            raise gr.Error(f"No trained model available for '{language}'.")
+        try:
+            analysis = analyze_evidence(
+                Path(audio_path),
+                case_id=case_id or "",
+                examiner=examiner or "",
+                service=service,
+                model_label=f"EfficientNet-B0 deepfake detector, {language} ({service.checkpoint_path.parent.name})",
+            )
+        except ValueError as exc:
+            raise gr.Error(str(exc)) from exc
+
+        findings = analysis.findings
+        lines = [
+            f"## Verdict: {findings.verdict}",
+            f"Model used: **{model_choice}**",
+            f"Probability synthetic: **{findings.fake_score:.4f}** "
+            + (
+                f"(genuine below {findings.genuine_below}, synthetic above {findings.synthetic_above})"
+                if findings.validated
+                else "(informational only - this model has no measured error rate)"
+            ),
+            f"Evidence SHA-256: `{findings.evidence.sha256}` — integrity "
+            f"{'verified' if findings.integrity_verified else '**FAILED**'}",
+            f"Report ID: `{findings.report_id}` (recorded in the chain-of-custody log)",
+        ]
+        if findings.error_rates is None:
+            lines.append("**MODEL NOT VALIDATED** - no decisive verdict is issued; do not use this as evidence.")
+        else:
+            rates = findings.error_rates
+            lines.append(
+                f"Known error rates on unseen sources: genuine reported synthetic "
+                f"{rates.genuine_called_synthetic:.1%}, synthetic reported genuine {rates.synthetic_called_genuine:.1%}."
+            )
+        segments = findings.segment_analysis
+        if segments is not None:
+            suspicious = segments.most_suspicious
+            flagged = sum(segment.verdict == LIKELY_SYNTHETIC for segment in segments.scored)
+            lines.insert(
+                2,
+                f"Scored {len(segments.scored)} window(s) across the whole recording; **{flagged}** flagged likely "
+                f"synthetic. Most suspicious: {suspicious.start_seconds:.1f}–{suspicious.end_seconds:.1f} s.",
+            )
+        lines += [f"> ⚠ {warning}" for warning in findings.warnings]
+        return (
+            "\n\n".join(lines),
+            render_timeline_image(findings),
+            findings.overlay_image,
+            [str(analysis.pdf_path), str(analysis.json_path)],
+        )
+
     with gr.Blocks(title="Explainable Audio Deepfake Detection") as demo:
         gr.Markdown(
             "# Explainable Audio Deepfake Detection for Bilingual Speech\n"
@@ -217,64 +284,105 @@ def create_demo(services: dict[str, InferenceService] | None = None) -> gr.Block
             info="Each language has its own trained checkpoint -- pick the one matching your clip's language.",
         )
 
-        with gr.Row():
-            with gr.Column(scale=1):
-                real_audio_input = gr.Audio(sources=["upload", "microphone"], type="filepath", label="Real clip")
-            with gr.Column(scale=1):
-                fake_audio_input = gr.Audio(sources=["upload", "microphone"], type="filepath", label="Fake clip")
-
-        analyze_button = gr.Button("Analyze both", variant="primary")
-
-        with gr.Row():
-            with gr.Column(scale=1):
-                real_processed_output = gr.Audio(label="Processed audio (real clip)", interactive=False)
-            with gr.Column(scale=1):
-                fake_processed_output = gr.Audio(label="Processed audio (fake clip)", interactive=False)
-
-        gr.Markdown("**Grad-CAM legend**")
-        gr.Image(
-            value=legend_image,
-            show_label=False,
-            interactive=False,
-            buttons=[],
-            container=False,
-            height=70,
-        )
-
-        with gr.Row():
-            with gr.Column(scale=1):
-                real_label_output = gr.Label(num_top_classes=len(LABEL_TO_INDEX), label="Prediction (real clip)")
+        with gr.Tabs():
+            with gr.Tab("Compare real vs fake"):
                 with gr.Row():
-                    real_spectrogram_output = gr.Image(label="Spectrogram (real clip)")
-                    real_gradcam_output = gr.Image(label="Grad-CAM (real clip)")
-                real_caption_output = gr.Markdown()
-            with gr.Column(scale=1):
-                fake_label_output = gr.Label(num_top_classes=len(LABEL_TO_INDEX), label="Prediction (fake clip)")
+                    with gr.Column(scale=1):
+                        real_audio_input = gr.Audio(sources=["upload", "microphone"], type="filepath", label="Real clip")
+                    with gr.Column(scale=1):
+                        fake_audio_input = gr.Audio(sources=["upload", "microphone"], type="filepath", label="Fake clip")
+
+                analyze_button = gr.Button("Analyze both", variant="primary")
+
                 with gr.Row():
-                    fake_spectrogram_output = gr.Image(label="Spectrogram (fake clip)")
-                    fake_gradcam_output = gr.Image(label="Grad-CAM (fake clip)")
-                fake_caption_output = gr.Markdown()
+                    with gr.Column(scale=1):
+                        real_processed_output = gr.Audio(label="Processed audio (real clip)", interactive=False)
+                    with gr.Column(scale=1):
+                        fake_processed_output = gr.Audio(label="Processed audio (fake clip)", interactive=False)
 
-        example_pairs = [row for row in _existing_example_pairs() if row[2] in services]
-        outputs = [
-            real_label_output, real_processed_output, real_spectrogram_output, real_gradcam_output, real_caption_output,
-            fake_label_output, fake_processed_output, fake_spectrogram_output, fake_gradcam_output, fake_caption_output,
-        ]
-        if example_pairs:
-            gr.Examples(
-                examples=example_pairs,
-                inputs=[real_audio_input, fake_audio_input, language_selector],
-                outputs=outputs,
-                fn=lambda real_path, fake_path, language: analyze_both(language, real_path, fake_path),
-                run_on_click=True,
-                label="Try a matched real/fake pair (same transcript) -- also sets the matching language model",
-            )
+                gr.Markdown("**Grad-CAM legend**")
+                gr.Image(
+                    value=legend_image,
+                    show_label=False,
+                    interactive=False,
+                    buttons=[],
+                    container=False,
+                    height=70,
+                )
 
-        analyze_button.click(
-            fn=analyze_both,
-            inputs=[language_selector, real_audio_input, fake_audio_input],
-            outputs=outputs,
-        )
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        real_label_output = gr.Label(num_top_classes=len(LABEL_TO_INDEX), label="Prediction (real clip)")
+                        with gr.Row():
+                            real_spectrogram_output = gr.Image(label="Spectrogram (real clip)")
+                            real_gradcam_output = gr.Image(label="Grad-CAM (real clip)")
+                        real_caption_output = gr.Markdown()
+                    with gr.Column(scale=1):
+                        fake_label_output = gr.Label(num_top_classes=len(LABEL_TO_INDEX), label="Prediction (fake clip)")
+                        with gr.Row():
+                            fake_spectrogram_output = gr.Image(label="Spectrogram (fake clip)")
+                            fake_gradcam_output = gr.Image(label="Grad-CAM (fake clip)")
+                        fake_caption_output = gr.Markdown()
+
+                example_pairs = [row for row in _existing_example_pairs() if row[2] in services]
+                outputs = [
+                    real_label_output, real_processed_output, real_spectrogram_output, real_gradcam_output, real_caption_output,
+                    fake_label_output, fake_processed_output, fake_spectrogram_output, fake_gradcam_output, fake_caption_output,
+                ]
+                if example_pairs:
+                    gr.Examples(
+                        examples=example_pairs,
+                        inputs=[real_audio_input, fake_audio_input, language_selector],
+                        outputs=outputs,
+                        fn=lambda real_path, fake_path, language: analyze_both(language, real_path, fake_path),
+                        run_on_click=True,
+                        label="Try a matched real/fake pair (same transcript) -- also sets the matching language model",
+                    )
+
+                analyze_button.click(
+                    fn=analyze_both,
+                    inputs=[language_selector, real_audio_input, fake_audio_input],
+                    outputs=outputs,
+                )
+
+            with gr.Tab("Forensic analysis"):
+                gr.Markdown(
+                    "Analyse one evidence recording for a case. The file is hashed (SHA-256) before "
+                    "and after analysis, given a three-way verdict (likely genuine / inconclusive / "
+                    "likely synthetic) with the model's known error rates, and recorded in a "
+                    "tamper-evident chain-of-custody log. Download the PDF report below. "
+                    "**The result supports, and does not replace, expert examination.**"
+                )
+                forensic_model_selector = gr.Radio(
+                    choices=list(forensic_choice_to_language),
+                    value=None,
+                    label="Model - choose the language spoken in the recording (required)",
+                    info="Hindi audio needs the Hindi model and English audio the English model; "
+                    "using the wrong one gives meaningless results.",
+                )
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        # gr.File, not gr.Audio: the evidence must be hashed byte-for-byte as
+                        # uploaded, and gr.Audio may re-encode the upload before we see it.
+                        evidence_input = gr.File(
+                            label="Evidence audio (wav, mp3, ogg/opus, m4a, amr, ...)",
+                            file_types=list(CONFIG.deployment.allowed_extensions),
+                            type="filepath",
+                        )
+                        case_id_input = gr.Textbox(label="Case / FIR / reference no.")
+                        examiner_input = gr.Textbox(label="Examiner name")
+                        forensic_button = gr.Button("Run forensic analysis", variant="primary")
+                    with gr.Column(scale=1):
+                        forensic_summary = gr.Markdown()
+                        forensic_files = gr.File(label="Report (PDF + JSON)", file_count="multiple")
+                forensic_timeline = gr.Image(label="Score per window across the recording")
+                forensic_gradcam = gr.Image(label="Grad-CAM (most suspicious window)")
+
+                forensic_button.click(
+                    fn=run_forensic_analysis,
+                    inputs=[forensic_model_selector, evidence_input, case_id_input, examiner_input],
+                    outputs=[forensic_summary, forensic_timeline, forensic_gradcam, forensic_files],
+                )
 
     logger.info("Gradio demo created for languages: %s.", ", ".join(services))
     return demo
