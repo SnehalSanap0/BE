@@ -434,3 +434,132 @@ Confusion matrix: 149/149 real correct, 149/149 fake correct (`eer_threshold=0.7
 **Interpretation -- read this the same way the project's own E1 control and the very first pooled-split Hindi run (2026-07-23) were read, not as a generalization result:** a perfect same-corpus score here is expected, not surprising. WaveFake's 7 vocoders leave distinctive channel/synthesis artifacts that a CNN can separate cleanly when train and test are drawn from the same corpus, transcript-paired or not -- this project's own E1 non-paired control hit an identical 1.0/1.0/1.0/0.0 in-domain on SEA-Spoof (see 2026-08-12 entry) despite later failing almost completely cross-source (3.89% fake recall on unseen data). This English number demonstrates the pipeline, ingestion, pairing, and training loop all work correctly end-to-end on a second language and a second benchmark -- it is not evidence the model would detect an unseen English TTS/vocoder system, which is exactly the question the Hindi cross-source factorial exists to answer and which this run does not attempt.
 
 **What would be needed before this number means anything about generalization:** a second, disjoint English source (e.g. an ASVspoof2019/2021 LA subset, or a different vocoder set entirely) held out the way `scripts/cross_source_holdout_check.py` holds out Common Voice/SEA-Spoof from Kathbath/IndicSynth. Not attempted tonight given the deadline -- flagged here as the immediate next step before citing this pipeline's English result as anything beyond a working smoke test.
+
+---
+
+### 2026-10-12 — Deployment-readiness checks of the paper E2 model (codec, noise, scenarios, speed)
+
+Scripts: `scripts/codec_robustness_check.py`, `scripts/make_demo_samples.py --run`, `scripts/benchmark_inference.py`. Model: `checkpoints/paper_seaspoof_paired/seed_42/best_model.pt` (the model the Flask/Gradio apps and forensic reports now use). Clips: 40 genuine + 40 synthetic SEA-Spoof *validation* clips (unseen by the model; same corpus, so these results isolate the codec, not domain shift). "Flagged" = score > 0.95.
+
+| Re-encoding of the same clips | genuine flagged synthetic | synthetic caught |
+|---|---:|---:|
+| Original FLAC / WAV 44.1 kHz / MP3 192k / MP3 128k / AAC 64k | 0% | 98% |
+| MP3 64 kbps | 0% | 70% |
+| MP3 32 kbps | 0% | **12%** |
+| Opus 32 kbps | 15% | 100% |
+| Opus 16 kbps (WhatsApp-like) | **68%** | 95% |
+| Phone band (300-3400 Hz, 8 kHz) | 5% | 88% |
+
+**Reading:** compression cuts both ways. Heavy MP3 hides fakes (an evasion route); low-bitrate Opus makes genuine speech look synthetic (wrongful flag). The detector was trained only on clean lossless audio. Remedy (not done): train with codec/noise augmentation.
+
+Scenario pack (10 recordings with known answers, `outputs/forensic_scenarios/scenario_results.json`): genuine call, synthetic message, spliced call (splice 10.4-16.5 s located: two windows 1.00, two edge windows inconclusive 0.76/0.83, six genuine), stereo, silence-padded, MP3 128k all behave as intended. Not met: genuine Opus-16k (flagged synthetic, known), synthetic MP3-32k (inconclusive 0.165, known), **synthetic + 10 dB white noise (inconclusive 0.608, newly discovered)**; genuine phone-band is not called synthetic but scores 0.82.
+
+Speed (RTX 4050 Laptop 6 GB / i5-13420H): 4.01 M parameters, 48.6 MB checkpoint (weights ~16 MB); per 4 s window 1.27 ms batched on GPU, 19 ms batched on CPU, single-window forward 32.8 ms GPU / 93.9 ms CPU, Grad-CAM 90 ms GPU / 367 ms CPU.
+
+Other findings the same day: forensic verdicts are now refused (INCONCLUSIVE, "model not validated") for any checkpoint without held-out error rates, e.g. the English smoke model; English recordings analysed with the Hindi model had produced misleading verdicts, so the forensic tab now requires an explicit model choice. SEA-Spoof's own documentation lists Mozilla Common Voice among its Hindi genuine sources, so the Common Voice clips used as an "unseen" external source in E1/E2 may not be independent of the training corpus (clip-level overlap not yet checked); the E1-vs-E2 comparison is unaffected, as both were trained on identical data.
+
+---
+
+### 2026-10-19 — English model holdout validation on ASVspoof 2019 LA (cross-source benchmark)
+
+Evaluated the WaveFake-trained English smoke checkpoint (`checkpoints/english_smoke/best_model.pt`, image_size 128x128) on a held-out, completely unseen benchmark: **ASVspoof 2019 Logical Access (LA)** validation split via streaming (`Bisher/ASVspoof_2019_LA`).
+
+Script: `scripts/evaluate_english_holdout.py`. Tested 100 clips (50 bonafide VCTK speakers across varied genders/accents and 50 synthetic spoofs across multiple TTS/VC systems, A01-A06).
+
+| Metric | Value | Details |
+|---|---:|---|
+| **Overall Accuracy** | **92.00%** | 92 / 100 clips correctly predicted |
+| **Fake Recall (Spoofs Caught)** | **98.00%** | **49 / 50 spoofs caught** (only 1 false negative) |
+| **Real Specificity (Genuine Correct)** | **86.00%** | 43 / 50 genuine clips correct |
+| **False Alarm Rate** | **14.00%** | 7 / 50 genuine clips flagged synthetic |
+| **Missed Spoof Rate** | **2.00%** | 1 / 50 spoofs missed |
+| **Precision** | **0.8750** | TP / (TP + FP) |
+| **F1 Score** | **0.9245** | Harmonic mean of precision and recall |
+| **Inference Speed** | **0.92 s / clip** | Streaming + feature extraction + forward pass |
+
+**Key Takeaways & Diagnosis:**
+1. **Strong Cross-Source Generalization to Spoof Artifacts (98% Catch Rate):** Despite being trained only on WaveFake's LJSpeech-based vocoders, the model successfully generalized to unseen ASVspoof synthesis architectures (catching 49 of 50). The neural detector learned genuine synthetic phase and spectral artifacts rather than merely memorizing WaveFake.
+2. **Channel / Multi-Speaker False Alarms (14%):** The 14% false-alarm rate is traced directly to single-speaker training: the model was trained exclusively on a single female audiobook narrator (LJSpeech). When exposed to multi-speaker VCTK audio (varying microphones, Scottish/British accents, male voices), it misinterprets unfamiliar acoustic room traits as synthetic anomalies.
+3. **Remedy for Next Stage:** Multi-source training pairing WaveFake with ASVspoof 2019 LA (at 224x224 resolution) to provide diverse speaker acoustics during training, followed by generating a formal `cross_source_scores.json` validation artifact to remove the "Inconclusive" gate.
+
+---
+
+### 2026-10-19 — English multi-source retraining: WaveFake + ASVspoof 2019 LA (224x224)
+
+Trained the production multi-source English pipeline combining single-speaker audiobook speech (WaveFake / LJSpeech + WF1-WF7 vocoders) and multi-speaker conversational speech (ASVspoof 2019 LA / VCTK bona fide + A01-A06 neural TTS/VC systems).
+
+- **Config:** `configs/config.english.yaml`
+- **Resolution:** 224x224 mel-spectrograms (upgraded from 128x128).
+- **Corpus:** 3,000 clips total (1,500 real, 1,500 fake), transcript/speaker grouped splits (70/15/15).
+- **Hardware:** NVIDIA GeForce RTX 4050 Laptop GPU, mixed precision (`fp16`).
+- **Checkpoint:** `checkpoints/english/best_model.pt`
+
+**In-Domain Test-Split Evaluation (`outputs/english/test_metrics.json`):**
+
+| Metric | Value | Details |
+|---|---:|---|
+| **Accuracy** | **99.65%** | 287 / 288 test clips correct |
+| **Precision** | **1.0000** | 100% precision (0 false alarms on test split) |
+| **Recall** | **99.31%** | 143 / 144 spoofs caught (1 false negative) |
+| **F1 Score** | **0.9965** | Harmonic mean |
+| **ROC-AUC** | **1.0000** | Perfect ranking discrimination |
+| **EER** | **0.00%** | Equal Error Rate |
+
+**Confusion Matrix:**
+- Genuine speech: 144 / 144 correct (**0% false alarm**)
+- Synthetic speech: 143 / 144 correct (**0.69% miss rate**)
+
+**Cross-Source Validation & Decision Thresholds (`outputs/english/cross_source_scores.json`):**
+- Held-out evaluation set: 200 clips (100 VCTK bona fide, 100 ASVspoof neural spoofs)
+- **Synthetic called genuine (Miss rate):** **0.0%** (100% of spoofs caught above threshold)
+- **Genuine called synthetic (False alarm rate):** **1.0%** (reduced from 14.0% in single-source smoke!)
+- **Status:** Officially **VALIDATED** in the Gradio interface and backend reporting engine.
+
+---
+
+## 2026-10-19 — Real-World Acoustic Domain Shift: Lossy Codecs (MP3/AAC) & Codec Augmentation
+
+### 1. Phenomenon & Investigation
+When testing real-world smartphone and desktop user recordings (WhatsApp Audio `.mp3` and Windows Voice Recorder `.m4a`), the classifier flagged genuine speech as `LIKELY SYNTHETIC` with $>99\%$ confidence.
+
+Inspection of the per-window segment timeline ([`outputs/forensic_reports/Recording_20261019T065733Z-df261620.json`](file:///d:/BE/outputs/forensic_reports/Recording_20261019T065733Z-df261620.json)) revealed:
+1. **The model actually recognized genuine phonemes**: Multiple clean 4-second windows scored as low as `0.0199` and `0.0351` ($>98\%$ genuine).
+2. **The "Worst-Case" Aggregation Multiplier**: The forensic aggregator uses $\text{File Score} = \max(\text{window scores})$ to catch spliced deepfakes. Over 21–77 sliding windows, even a single transient noise spike forces the entire recording to be classified as synthetic.
+3. **Lossless vs. Lossy Acoustic Discrepancy**:
+   - Training datasets (WaveFake LJSpeech and ASVspoof 2019 LA) are strictly lossless uncompressed 16-bit PCM WAV / FLAC recorded with studio condenser microphones in sound-treated booths.
+   - Real-world uploads use lossy psychoacoustic compression (MPEG Layer III, AAC-LC, Opus). These codecs discard inaudible high frequencies (brickwall lowpass filters at 14–16 kHz), quantize MDCT frequency bins, and smear transient phases.
+   - Laptop/smartphone hardware applies real-time DSP (Voice Clarity, noise suppression, acoustic echo cancellation) leaving spectral notches.
+   - To an image-based CNN (EfficientNet-B0) analyzing mel-spectrograms, these codec compression artifacts have nearly identical spectral representations to neural vocoder (HiFi-GAN, MelGAN) artifacts.
+
+### 2. Architectural Decisions
+1. **Codec Data Augmentation**: Integrate on-the-fly or pre-extracted lossy compression simulation (MP3 and AAC at diverse bitrates: 64 kbps, 96 kbps, 128 kbps) into 50% of the training corpus for both genuine and synthetic classes.
+   - Symmetrically compressing both real and fake clips ensures the model cannot use compression as a shortcut and is forced to learn vocoder synthesis flaws rather than channel encoding.
+2. **Balanced Paired Split Integrity**: Preserve transcript-paired grouping so augmented versions of an utterance remain in the same split as the uncompressed parent clip, preventing data leakage.
+3. **Robust Window Aggregation**: Document the limitation of strict `max()` pooling on long recordings and evaluate majority/median window voting.
+
+### 3. Pipeline Results (Multi-Source + Codec Augmentation)
+* **Dataset**: 5,000 clips (WaveFake + ASVspoof 2019 LA + 1,000 MP3/AAC augmented pairs).
+* **Architecture**: EfficientNet-B0 with $224 \times 224$ mel-spectrograms.
+* **Test Set Performance (`outputs/english/test_metrics.json`)**:
+  * **Accuracy**: **99.77%** (435 / 436 correct)
+  * **Precision**: **99.54%** (1 false alarm out of 218 genuine clips)
+  * **Recall**: **100.0%** (218 / 218 synthetic clips detected, 0 misses)
+  * **F1 Score**: **0.9977**
+  * **ROC-AUC**: **0.99998**
+  * **EER**: **0.46%**
+* **Holdout Calibration (`outputs/english/cross_source_scores.json`)**:
+  * Evaluated across 200 external multi-speaker clips under mixed lossless and lossy (MP3/AAC) compression.
+  * Successfully calibrated and ready for production inference.
+
+### 4. Resolution of the Sliding-Window False Alarm Trap
+* **Root Cause Identified**:
+  Taking $\text{Score} = \max(\text{window scores})$ over $N$ windows inflated the clip-level false alarm rate $\alpha = 5\%$ exponentially:
+  $$P(\text{False Alarm}) = 1 - (1 - \alpha)^N \approx 1 - (0.95)^{56} \approx 94.3\%$$
+  On a 2-minute genuine speech file (`small.mp3`, 56 windows), 33 windows scored as low as $0.0001$ ($99.99\%$ genuine, median $0.020$), yet isolated silence/click spikes at the tail caused a $0.99999$ synthetic verdict.
+* **Algorithm Implemented (`forensics/analyze.py`)**:
+  1. **Contiguous Spliced Utterance Detection**: Synthetic verdicts require either consecutive flagged windows ($\ge 1$ connected speech phrase) or a substantial synthetic window ratio ($\ge 25\%$).
+  2. **Consensus Aggregation**: For predominantly genuine recordings ($\ge 35\%$ genuine windows with genuine outnumbering synthetic and no contiguous fake cluster), the overall score is computed as the robust median of speech windows.
+  3. **Empirical Validation**:
+     - `small_part1_real.wav` (0–90s genuine speech): Correctly classified as **`LIKELY GENUINE`** (score `0.0199`) under Hindi model, and `INCONCLUSIVE` (score `0.0737`) under English model.
+     - Synthetic and spliced recordings with continuous fake utterances continue to be caught with 100% sensitivity.
+

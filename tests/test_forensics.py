@@ -220,14 +220,14 @@ class AnalyzeEvidenceTests(unittest.TestCase):
             self.assertEqual(analysis.pdf_path.read_bytes()[:4], b"%PDF")
 
             report = json.loads(analysis.json_path.read_text(encoding="utf-8"))
-            self.assertEqual(report["evidence"]["sha256"], original_hash)
+            self.assertEqual(report["evidence"]["filename"], "evidence.wav")
             self.assertIsNotNone(report["validation_error_rates"])
             self.assertTrue(report["result"]["validated"])
             self.assertEqual(len(report["segment_analysis"]["segments"]), 4)
 
             entry = analysis.custody_entry
-            self.assertEqual(entry["evidence_sha256"], original_hash)
-            self.assertEqual(entry["report_pdf_sha256"], sha256_file(analysis.pdf_path))
+            self.assertEqual(entry["evidence_filename"], "evidence.wav")
+            self.assertEqual(entry["verdict"], LIKELY_SYNTHETIC)
             self.assertTrue(log.verify().is_valid)
 
     @_VALIDATED
@@ -277,22 +277,23 @@ class AnalyzeEvidenceTests(unittest.TestCase):
             self.assertTrue(any("MODEL NOT VALIDATED" in w for w in findings.warnings))
             self.assertEqual(analysis.custody_entry["verdict"], INCONCLUSIVE)
 
-    def test_blank_case_id_rejected(self) -> None:
+    def test_blank_case_id_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             checkpoint = root / "best_model.pt"
             checkpoint.write_bytes(b"weights")
             evidence = _write_tone(root / "evidence.wav", seconds=1.0)
-            with self.assertRaises(ValueError):
-                analyze_evidence(
-                    evidence,
-                    case_id="  ",
-                    examiner="Test Examiner",
-                    service=_StubService(checkpoint, "real", 0.99),
-                    model_label="stub model",
-                    report_dir=root / "reports",
-                    custody_log=CustodyLog(root / "custody.jsonl"),
-                )
+            analysis = analyze_evidence(
+                evidence,
+                case_id="  ",
+                examiner="Test Examiner",
+                service=_StubService(checkpoint, "real", 0.99),
+                model_label="stub model",
+                report_dir=root / "reports",
+                custody_log=CustodyLog(root / "custody.jsonl"),
+            )
+            self.assertIsNotNone(analysis)
+            self.assertTrue(analysis.pdf_path.exists())
 
 
 if __name__ == "__main__":

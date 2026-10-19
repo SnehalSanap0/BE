@@ -124,4 +124,4 @@ deployment:
   debug: false
   max_upload_size_mb: 25
   allowed_extensions: [".wav"]
-  model_checkpoint: "checkpoints/paper_seaspoof_nonpaired/best_model.pt"
+  model_checkpoint: "checkpoints/paper_seaspoof_nonpaired/seed_42/best_model.pt"

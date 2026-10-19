@@ -18,6 +18,9 @@ data/smoke_seaspoof_paired
 data/paper_seaspoof_paired
 data/paper_seaspoof_nonpaired
 data/english_smoke
+data/english/
+user_test_audio/
+scratch/
 
 # Logs, checkpoints, outputs
 logs/
@@ -33,3 +36,12 @@ outputs/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Forensic demo samples (derived from a gated dataset; do not redistribute)
+samples/
+
+# Final-year project report (kept local) and the scripts that build it
+Final_Year_Project_Report/
+
+# Notebooks (kept local)
+notebooks/

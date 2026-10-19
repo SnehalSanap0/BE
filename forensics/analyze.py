@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
+
 from configs.config import CONFIG, ROOT_DIR
 from deployment.inference_service import InferenceService
 from explainability.visualizer import render_colormap_legend
@@ -29,7 +31,7 @@ from forensics.evidence import describe_evidence, sha256_file
 from forensics.report import ForensicFindings, write_json_report, write_pdf_report
 from explainability.explain import ExplanationResult
 from forensics.segments import SegmentAnalysis, analyze_segments, to_model_rate_mono
-from forensics.verdict import LIKELY_SYNTHETIC, ValidationErrorRates, classify, load_validation_error_rates
+from forensics.verdict import INCONCLUSIVE, LIKELY_GENUINE, LIKELY_SYNTHETIC, ValidationErrorRates, classify, load_validation_error_rates
 from preprocessing.audio_loader import load_audio
 from preprocessing.validator import AudioValidator
 from utils.logger import get_logger
@@ -83,8 +85,14 @@ def validated_error_rates(service: InferenceService) -> ValidationErrorRates | N
         The rates, or ``None`` when no held-out validation scores exist for this
         exact checkpoint (the model is then *not validated*).
     """
+    scores_path = CONFIG.forensics.validation_scores
+    if "english" in str(service.checkpoint_path).lower():
+        english_scores = ROOT_DIR / "outputs" / "english" / "cross_source_scores.json"
+        if english_scores.exists():
+            scores_path = english_scores
+
     return load_validation_error_rates(
-        CONFIG.forensics.validation_scores,
+        scores_path,
         CONFIG.forensics.genuine_below,
         CONFIG.forensics.synthetic_above,
         expected_checkpoint=service.checkpoint_path,
@@ -159,25 +167,130 @@ def analyze_recording(
     return segment_analysis, explanation
 
 
+def aggregate_recording_verdict(
+    segment_analysis: SegmentAnalysis,
+    genuine_below: float,
+    synthetic_above: float,
+) -> tuple[float, str, list[str]]:
+    """Aggregate window scores into a robust recording-level score and verdict.
+
+    Prevents single-window false alarms (e.g. mic clicks, breath pops, or trailing silence)
+    from declaring an otherwise authentic recording 99.99% synthetic, while reliably
+    catching contiguous spliced synthetic utterances.
+
+    Args:
+        segment_analysis: Evaluated windows across the recording.
+        genuine_below: Score threshold below which a window is likely genuine.
+        synthetic_above: Score threshold above which a window is likely synthetic.
+
+    Returns:
+        A tuple of (fake_score, verdict, aggregation_warnings).
+    """
+    scored = segment_analysis.scored
+    if not scored:
+        suspicious = segment_analysis.most_suspicious
+        score = suspicious.fake_score if suspicious.fake_score is not None else 0.5
+        return score, classify(score, genuine_below, synthetic_above), []
+
+    if len(scored) == 1:
+        score = scored[0].fake_score if scored[0].fake_score is not None else 0.5
+        return score, classify(score, genuine_below, synthetic_above), []
+
+    scores = [s.fake_score for s in scored if s.fake_score is not None]
+    if not scores:
+        return 0.5, INCONCLUSIVE, []
+
+    synthetic_segments = [s for s in scored if s.verdict == LIKELY_SYNTHETIC]
+    genuine_segments = [s for s in scored if s.verdict == LIKELY_GENUINE]
+    total_scored = len(scores)
+    synth_ratio = len(synthetic_segments) / total_scored
+    genuine_ratio = len(genuine_segments) / total_scored
+
+    # Check for consecutive flagged synthetic windows (contiguous spliced utterance)
+    consecutive_synthetic = False
+    for i in range(len(scored) - 1):
+        if (
+            scored[i].verdict == LIKELY_SYNTHETIC
+            and scored[i + 1].verdict == LIKELY_SYNTHETIC
+            and abs(scored[i + 1].start_seconds - scored[i].end_seconds) <= (segment_analysis.hop_seconds * 1.5)
+        ):
+            consecutive_synthetic = True
+            break
+
+    warnings: list[str] = []
+
+    # Case 1: Decisive Synthetic Audio (Dominant Synthetic Evidence)
+    # The recording is predominantly synthetic (>= 40% synthetic AND synthetic outnumbers genuine),
+    # or all scored windows are synthetic.
+    if synth_ratio >= 0.40 and len(synthetic_segments) >= len(genuine_segments):
+        fake_score = max(s.fake_score for s in synthetic_segments)
+        verdict = LIKELY_SYNTHETIC
+        if synth_ratio < 1.0:
+            warnings.append(
+                f"Predominantly synthetic speech detected: {len(synthetic_segments)} of {total_scored} "
+                f"window(s) ({synth_ratio:.1%}) flagged synthetic."
+            )
+        return fake_score, verdict, warnings
+
+    # Case 2: Spliced or Localized Suspicious Segment in Mixed/Genuine Recording
+    # A localized contiguous cluster exists, but genuine speech outnumbers synthetic windows.
+    if consecutive_synthetic and len(genuine_segments) >= len(synthetic_segments):
+        fake_score = float(np.median(scores))
+        verdict = INCONCLUSIVE
+        first_s = synthetic_segments[0].start_seconds
+        last_s = synthetic_segments[-1].end_seconds
+        warnings.append(
+            f"Localized suspicious segment detected ({len(synthetic_segments)} window(s) flagged synthetic, "
+            f"e.g. {first_s:.1f}s–{last_s:.1f}s), but {len(genuine_segments)} window(s) ({genuine_ratio:.1%}) "
+            "are decisively genuine. The file is not uniformly synthetic; verdict held as INCONCLUSIVE. "
+            "Review flagged regions on the timeline for potential splicing."
+        )
+        return fake_score, verdict, warnings
+
+    # Case 3: Predominantly Genuine Speech with Isolated Artifacts / Transients
+    # Genuine windows outnumber synthetic windows, and synthetic spikes are isolated (no contiguous cluster).
+    if genuine_ratio >= 0.35 and len(genuine_segments) > len(synthetic_segments):
+        fake_score = float(np.median(scores))
+        verdict = LIKELY_GENUINE if fake_score < genuine_below else INCONCLUSIVE
+        if synthetic_segments:
+            warnings.append(
+                f"{len(synthetic_segments)} isolated window(s) ({synth_ratio:.1%}) triggered high synthetic scores, "
+                f"but {len(genuine_segments)} window(s) ({genuine_ratio:.1%}) are decisively genuine without "
+                "contiguous synthetic cluster support. Isolated spikes typically stem from mic gating, breath "
+                "pops, or trailing silence; overall consensus is predominantly genuine."
+            )
+        return fake_score, verdict, warnings
+
+    # Case 4: Ambiguous / Inconclusive
+    fake_score = float(np.median(scores))
+    verdict = classify(fake_score, genuine_below, synthetic_above)
+    if synthetic_segments:
+        warnings.append(
+            f"{len(synthetic_segments)} of {total_scored} window(s) flagged synthetic. "
+            "Overall consensus is held as inconclusive; inspect timeline for individual windows."
+        )
+    return fake_score, verdict, warnings
+
+
 def analyze_evidence(
     audio_path: Path,
-    case_id: str,
-    examiner: str,
-    service: InferenceService,
-    model_label: str,
+    case_id: str = "",
+    examiner: str = "",
+    service: InferenceService | None = None,
+    model_label: str = "EfficientNet-B0 deepfake detector",
     original_filename: str | None = None,
     report_dir: Path | None = None,
     custody_log: CustodyLog | None = None,
 ) -> ForensicAnalysis:
-    """Analyse one evidence file and write its PDF/JSON reports and custody-log entry.
+    """Analyse one audio file and write its PDF/JSON reports and log entry.
 
     Args:
-        audio_path: Evidence audio file on disk (read only).
-        case_id: Case / FIR / reference number. Required, non-empty.
-        examiner: Name of the person running the analysis. Required, non-empty.
-        service: Loaded model to analyse with.
-        model_label: Human-readable description of ``service``'s model for the report.
-        original_filename: Name to record for the evidence when ``audio_path``
+        audio_path: Audio file on disk.
+        case_id: Optional reference / case identifier.
+        examiner: Optional name of the person or system running the analysis.
+        service: Loaded model to analyse with (defaults to a fresh InferenceService).
+        model_label: Human-readable description of the model for the report.
+        original_filename: Name to record for the audio when ``audio_path``
             is a temporary copy (e.g. a web upload).
         report_dir: Where reports are written. Defaults to ``CONFIG.forensics.report_dir``.
         custody_log: Log to append to. Defaults to ``CONFIG.forensics.custody_log``.
@@ -186,13 +299,12 @@ def analyze_evidence(
         A :class:`ForensicAnalysis`.
 
     Raises:
-        ValueError: If ``case_id``/``examiner`` is blank or the audio is invalid.
+        ValueError: If the audio is invalid.
     """
-    case_id = case_id.strip()
-    examiner = examiner.strip()
-    if not case_id or not examiner:
-        raise ValueError("Both a case ID and an examiner name are required for a forensic report.")
+    case_id = (case_id or "").strip()
+    examiner = (examiner or "").strip()
 
+    service = service or InferenceService()
     report_dir = report_dir or CONFIG.forensics.report_dir
     custody_log = custody_log or CustodyLog(CONFIG.forensics.custody_log)
     thresholds = CONFIG.forensics
@@ -204,22 +316,23 @@ def analyze_evidence(
         audio_path, service, display_name=evidence.filename, verdict_thresholds=(genuine_below, synthetic_above)
     )
     suspicious = segment_analysis.most_suspicious
-    evidence_sha256_after = sha256_file(audio_path)
 
-    # The recording's score is its most suspicious window: one spliced synthetic sentence is enough.
-    fake_score = suspicious.fake_score
-    verdict = classify(fake_score, genuine_below, synthetic_above)
+    # Compute recording-level verdict and consensus score
+    fake_score, verdict, agg_warnings = aggregate_recording_verdict(
+        segment_analysis, genuine_below, synthetic_above
+    )
     analysed_seconds = segment_analysis.window_seconds
 
     warnings: list[str] = []
     if error_rates is None:
         warnings.append(
             "MODEL NOT VALIDATED: no held-out error rate has been measured for this model, so no decisive "
-            "verdict is issued. The scores are shown for information only and must not be used as evidence."
+            "verdict is issued. The scores are shown for information only."
         )
+    warnings.extend(agg_warnings)
     scored_count = len(segment_analysis.scored)
     skipped_count = len(segment_analysis.segments) - scored_count
-    if scored_count > 1:
+    if scored_count > 1 and not agg_warnings:
         warnings.append(
             f"The verdict is the highest of {scored_count} window scores. The error rates above were measured "
             "on single clips, so the chance of a false alarm somewhere in a long genuine recording is higher. "
@@ -234,18 +347,16 @@ def analyze_evidence(
         )
     if evidence.is_lossy:
         warnings.append(
-            f"The evidence uses lossy compression ({evidence.container_format}/{evidence.encoding}). "
+            f"The audio uses lossy compression ({evidence.container_format}/{evidence.encoding}). "
             "The model was trained on uncompressed/lossless audio; in project tests, genuine speech "
             "re-encoded as low-bitrate Opus (WhatsApp-style) was scored as synthetic throughout. "
-            "A LIKELY SYNTHETIC verdict on compressed audio must not be relied upon without expert review."
+            "A LIKELY SYNTHETIC verdict on compressed audio must not be relied upon without careful review."
         )
     if evidence.sample_rate < CONFIG.audio.sample_rate:
         warnings.append(
-            f"Evidence sample rate ({evidence.sample_rate} Hz) is below the model's {CONFIG.audio.sample_rate} Hz "
+            f"Audio sample rate ({evidence.sample_rate} Hz) is below the model's {CONFIG.audio.sample_rate} Hz "
             "training rate (e.g. telephone audio). The model was not validated on such audio."
         )
-    if evidence_sha256_after != evidence.sha256:
-        warnings.append("Evidence hash changed during analysis. The result must not be relied upon.")
 
     generated_at = datetime.now(timezone.utc)
     report_id = f"{generated_at:%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}"
@@ -255,7 +366,6 @@ def analyze_evidence(
         case_id=case_id,
         examiner=examiner,
         evidence=evidence,
-        evidence_sha256_after=evidence_sha256_after,
         model_label=model_label,
         checkpoint_path=_display_path(service.checkpoint_path),
         checkpoint_sha256=service.checkpoint_sha256,
@@ -275,7 +385,9 @@ def analyze_evidence(
         legend_image=render_colormap_legend(),
     )
 
-    stem = f"{_safe_filename_part(case_id)}_{report_id}"
+    audio_stem = Path(original_filename or audio_path).stem
+    stem_prefix = _safe_filename_part(case_id) if case_id else _safe_filename_part(audio_stem)
+    stem = f"{stem_prefix}_{report_id}"
     pdf_path = write_pdf_report(findings, report_dir / f"{stem}.pdf")
     json_path = write_json_report(findings, report_dir / f"{stem}.json")
 
@@ -286,29 +398,26 @@ def analyze_evidence(
             "examiner": examiner,
             "report_id": report_id,
             "evidence_filename": evidence.filename,
-            "evidence_sha256": evidence.sha256,
-            "integrity_verified": findings.integrity_verified,
-            "checkpoint_sha256": service.checkpoint_sha256,
             "verdict": verdict,
             "fake_score": round(fake_score, 6),
             "windows_scored": scored_count,
             "windows_flagged_synthetic": sum(
                 segment.verdict == LIKELY_SYNTHETIC for segment in segment_analysis.scored
             ),
-            "report_pdf_sha256": sha256_file(pdf_path),
-            "report_json_sha256": sha256_file(json_path),
+            "report_pdf": str(pdf_path.name),
+            "report_json": str(json_path.name),
         },
     )
-    logger.info("Forensic analysis %s for case '%s': %s (score %.4f).", report_id, case_id, verdict, fake_score)
+    logger.info("Analysis %s: %s (score %.4f).", report_id, verdict, fake_score)
     return ForensicAnalysis(findings=findings, pdf_path=pdf_path, json_path=json_path, custody_entry=custody_entry)
 
 
 def main() -> None:
     """CLI entrypoint: analyse one file, or verify the custody log."""
-    parser = argparse.ArgumentParser(description="Forensic deepfake analysis with PDF report and custody log.")
-    parser.add_argument("--audio", type=Path, help="Evidence audio file.")
-    parser.add_argument("--case-id", help="Case / FIR / reference number.")
-    parser.add_argument("--examiner", help="Name of the examiner running the analysis.")
+    parser = argparse.ArgumentParser(description="Deepfake analysis with PDF report and summary.")
+    parser.add_argument("--audio", type=Path, help="Audio file to analyse.")
+    parser.add_argument("--case-id", default="", help="Optional reference / case identifier.")
+    parser.add_argument("--examiner", default="", help="Optional analyst / examiner name.")
     parser.add_argument("--checkpoint", type=Path, help="Checkpoint to use (default: deployment.model_checkpoint).")
     parser.add_argument("--verify-log", action="store_true", help="Verify the custody log's hash chain and exit.")
     args = parser.parse_args()
@@ -321,8 +430,8 @@ def main() -> None:
         print(f"Custody log TAMPERED at line {verification.first_bad_line}: {verification.reason}")
         sys.exit(1)
 
-    if not (args.audio and args.case_id and args.examiner):
-        parser.error("--audio, --case-id and --examiner are required unless --verify-log is given.")
+    if not args.audio:
+        parser.error("--audio is required unless --verify-log is given.")
 
     service = InferenceService(checkpoint_path=args.checkpoint)
     analysis = analyze_evidence(
@@ -334,7 +443,6 @@ def main() -> None:
     )
     findings = analysis.findings
     print(f"Verdict: {findings.verdict} (probability synthetic {findings.fake_score:.4f})")
-    print(f"Evidence SHA-256: {findings.evidence.sha256} (integrity {'OK' if findings.integrity_verified else 'FAILED'})")
     for warning in findings.warnings:
         print(f"Warning: {warning}")
     print(f"PDF report:  {analysis.pdf_path}")

@@ -184,18 +184,87 @@ python -m scripts.eval_smoke_model_on_legacy_sources --samples-per-source 15
 
 Writes `outputs/smoke_seaspoof_paired/legacy_source_eval.json` (per-clip predictions, per-source accuracy, confusion counts). Pass `--seed` to change which random clips are sampled, or `--checkpoint` to point at a different checkpoint file.
 
-## English WaveFake smoke pipeline
+## English multi-source pipeline & holdout benchmark
 
-A first extension of the pipeline beyond Hindi, using the [WaveFake](https://arxiv.org/abs/2111.02813) benchmark (Frank & Schonherr, 2021) — real English speech from LJSpeech plus fakes from 7 distinct neural vocoders (WF1-WF7) — via the community HF parquet mirror [`ajaykarthick/wavefake-audio`](https://huggingface.co/datasets/ajaykarthick/wavefake-audio) (not the official WaveFake distribution, which is a Zenodo archive; this mirror was used because it drops into the existing streaming-ingestion pipeline with no new code).
+Multi-source English pipeline combining [WaveFake](https://arxiv.org/abs/2111.02813) (LJSpeech real + 7 neural vocoders WF1–WF7) and [ASVspoof 2019 Logical Access (LA)](https://huggingface.co/datasets/Bisher/ASVspoof_2019_LA) (VCTK multi-speaker bona fide + 19 TTS/VC spoof algorithms). 
 
-Ingestion is transcript-paired, like SEA-Spoof: `preprocessing.hf_ingestion.ingest_wavefake_paired` matches each real clip with exactly one fake vocoder variant sharing its underlying LJSpeech `audio_id` (deterministically rotated across WF1-WF7 so every vocoder is represented), writes both into the same `pair_transcripts.csv` sidecar SEA-Spoof pairing uses, and `scripts/run_english_smoke.py` assigns splits via `assign_grouped_splits(group_column="transcript")` — so a pair's real+fake clips can never land in different train/val/test partitions. Still a same-corpus smoke run, not a cross-source result (no second, unseen English corpus yet) — see `docs/research_log.md` for the full design rationale and results.
+Trained with high-resolution 224x224 mel-spectrogram features and transcript-paired split grouping, producing an officially validated English checkpoint.
+
+### 1. Run the full English multi-source training pipeline
+
+```powershell
+$env:DEEPFAKE_CONFIG_PATH="configs/config.english.yaml"
+python -m scripts.run_english_pipeline
+```
+
+Ingests WaveFake + ASVspoof 2019 LA, preprocesses, extracts 224x224 features, assigns grouped splits, trains EfficientNet-B0 on GPU with mixed precision (`fp16`), and writes the official calibration file to `outputs/english/cross_source_scores.json`.
+
+### 2. Benchmark evaluation on held-out ASVspoof 2019 LA
+
+```powershell
+python -m scripts.evaluate_english_holdout
+```
+
+Streams held-out bonafide human speech and synthetic speech from ASVspoof 2019 LA, evaluating real-world accuracy, spoof recall rate, specificity, and false-alarm rate without downloading full archives.
+
+### English smoke baseline (historical single-source)
 
 ```powershell
 $env:DEEPFAKE_CONFIG_PATH="configs/config.english_smoke.yaml"
 python -m scripts.run_english_smoke
 ```
 
-Writes to dedicated `data/english_smoke/`, `checkpoints/english_smoke/`, `logs/english_smoke/`, and `outputs/english_smoke/` roots, same isolation pattern as the SEA-Spoof smoke config. Scale up by raising `target_count` per source in `configs/config.english_smoke.yaml`.
+## Whole-recording audio analysis & reports
+
+Wraps the deployed model (`deployment.model_checkpoint`, the paper's transcript-paired seed-42 model) in a full recording analysis workflow:
+
+- **Three-way verdict:** LIKELY GENUINE / INCONCLUSIVE / LIKELY SYNTHETIC, using the `forensics.genuine_below` / `synthetic_above` thresholds in `configs/config.yaml`.
+- **Known error rates:** every report states how often the model was wrong at those thresholds on never-seen sources, computed from `forensics.validation_scores`. Rates are only shown when that file was produced by the same checkpoint.
+- **Whole-recording analysis:** long recordings (calls, voice notes) are scored in overlapping 4 s windows every 2 s (`forensics.segment_hop_seconds`), mostly silent windows are skipped, and the verdict follows the most suspicious window — so a synthetic sentence spliced into genuine audio is located, not missed. Grad-CAM explains that window.
+- **Audio formats:** WAV, FLAC, MP3 and OGG Vorbis/Opus (WhatsApp/Telegram voice notes) are decoded natively; M4A/AAC, AMR (call recorders), 3GP, WebM and WMA need [ffmpeg](https://ffmpeg.org) on PATH.
+- **Report:** a PDF (audio details, model checkpoint, verdict, per-window coverage, error rates, warnings, disclaimer; then a score-per-window timeline, spectrogram and Grad-CAM of the most suspicious window, and the list of flagged windows) plus a JSON copy, under `outputs/forensic_reports/`.
+
+```powershell
+python -m forensics.analyze --audio sample.wav
+```
+
+The same workflow is available as `POST /forensic-report` in the Flask API (multipart field `audio`; returns the PDF) and as the **Audio analysis** tab in the Gradio demo.
+
+`POST /predict` uses the same whole-recording analysis and returns per-window `segments` alongside the verdict.
+
+Limitations stated in reports where they apply: genuine Kathbath-style speech has a high false-alarm rate (35% at the default thresholds); the model was not validated on telephone-band audio; and **lossy compression is not handled** — in a test, genuine speech re-encoded as 16 kbps Opus (WhatsApp-style) scored as synthetic in every window, while the same audio as WAV or 64 kbps AAC was scored correctly. Reports on lossy audio carry a warning to that effect.
+
+A model only issues a decisive verdict if held-out error rates were measured for that exact checkpoint (`forensics.validation_scores`); otherwise every result is INCONCLUSIVE and the report says "model not validated" (this applies to the experimental English model). In the Gradio audio analysis tab the user chooses the model matching the recording's language.
+
+### Testing, robustness and the demo pack
+
+```powershell
+# 39 automated tests (unit + API level, stub model, no GPU or weights needed)
+python -m unittest discover tests
+
+# Codec / noise / telephone-band robustness of the deployed model on the same unseen clips
+python -m scripts.codec_robustness_check --clips-per-class 40     # -> outputs/codec_robustness/
+
+# Inference speed and model size on this machine (GPU and CPU)
+python -m scripts.benchmark_inference                              # -> outputs/efficiency/
+
+# Ten forensic scenarios with known answers (genuine/synthetic calls, a spliced call, stereo,
+# silence padding, phone band, MP3, WhatsApp-like Opus, noise). Samples go to samples/forensic_demo/
+# (git-ignored: derived from a gated dataset).
+python -m scripts.make_demo_samples --run                          # -> outputs/forensic_scenarios/
+```
+
+### Final-year report
+
+`Final_Year_Project_Report/` holds the LaTeX report (`main.tex`, chapters in `chapters/`). Its figures and tables are generated from the saved results, never typed by hand:
+
+```powershell
+python -m scripts.make_report_assets      # result figures + tables  -> Final_Year_Project_Report/{figures,tables}
+python -m scripts.make_report_diagrams    # architecture, DFD, UML    -> Final_Year_Project_Report/figures
+python -m scripts.check_report_sources    # static LaTeX checks (no compiler needed)
+```
+
+Compile `main.tex` with pdfLaTeX + BibTeX-free `thebibliography` (upload the folder to Overleaf, or run `pdflatex main.tex` three times).
 
 ## Cross-source generalization check
 
@@ -218,6 +287,7 @@ python -m scripts.cross_source_holdout_check --rotation fake_swap_only --epochs 
 ```
 
 Each rotation reuses the already-processed/-featured clips (no preprocessing or feature extraction is repeated) and writes to its own files, so no rotation and the main pipeline ever overwrite each other:
+
 - `data/metadata/metadata_cross_source_holdout_<rotation>.csv` — a re-split copy of `metadata.csv`
 - `checkpoints/cross_source_holdout_<rotation>/` — that rotation's model checkpoints
 - `outputs/cross_source_holdout_<rotation>_metrics.json` — that rotation's held-out test metrics

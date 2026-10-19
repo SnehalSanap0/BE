@@ -25,10 +25,13 @@ from forensics.evidence import EvidenceInfo  # noqa: E402
 from forensics.segments import SegmentAnalysis  # noqa: E402
 from forensics.verdict import INCONCLUSIVE, LIKELY_GENUINE, LIKELY_SYNTHETIC, ValidationErrorRates  # noqa: E402
 
+matplotlib.rcParams["font.family"] = "sans-serif"
+matplotlib.rcParams["font.sans-serif"] = ["Segoe UI", "DejaVu Sans", "Arial", "sans-serif"]
+
 _A4_INCHES = (8.27, 11.69)
-_WRAP_CHARS = 95
-_BOTTOM_MARGIN = 0.04
-_VERDICT_COLORS = {LIKELY_GENUINE: "#1b7f3b", INCONCLUSIVE: "#b26a00", LIKELY_SYNTHETIC: "#b3261e"}
+_WRAP_CHARS = 90
+_BOTTOM_MARGIN = 0.055
+_VERDICT_COLORS = {LIKELY_GENUINE: "#16a34a", INCONCLUSIVE: "#d97706", LIKELY_SYNTHETIC: "#dc2626"}
 
 DISCLAIMER = (
     "This report is the output of an automated statistical classifier and is intended to support, "
@@ -41,26 +44,26 @@ DISCLAIMER = (
 
 @dataclass(frozen=True)
 class ForensicFindings:
-    """Everything a forensic report states about one analysis.
+    """Everything a report states about one analysis.
 
     Attributes:
         report_id: Unique ID of this report.
         generated_at_utc: ISO-8601 UTC timestamp of the analysis.
-        case_id: Case / FIR / reference number supplied by the examiner.
-        examiner: Name of the person who ran the analysis.
-        evidence: Hash and metadata of the evidence file, taken before analysis.
-        evidence_sha256_after: Hash recomputed after analysis (integrity check).
-        model_label: Human-readable model description.
-        checkpoint_path: Checkpoint file used.
-        checkpoint_sha256: SHA-256 of the checkpoint file.
-        checkpoint_epoch: Training epoch the checkpoint was saved at.
-        fake_score: Model probability that the evidence is synthetic.
+        evidence: Metadata of the evidence audio file.
+        fake_score: Model probability that the audio is synthetic.
         verdict: Three-way verdict (see :mod:`forensics.verdict`).
         genuine_below: Lower verdict threshold used.
         synthetic_above: Upper verdict threshold used.
         analysed_seconds: Length of audio actually fed to the model.
         peak_region_caption: Time/frequency region that most influenced the prediction.
         error_rates: Known validation error rates at these thresholds, if available.
+        case_id: Optional reference / case identifier.
+        examiner: Optional examiner / analyst name.
+        evidence_sha256_after: Optional hash for backwards compatibility.
+        model_label: Human-readable model description.
+        checkpoint_path: Checkpoint file used.
+        checkpoint_sha256: SHA-256 of the checkpoint file if tracked.
+        checkpoint_epoch: Training epoch the checkpoint was saved at.
         segment_analysis: Per-window scores over the whole recording, if computed.
         validated: ``False`` if no held-out error rate exists for the model; the verdict is then
             always INCONCLUSIVE and the scores are informational only.
@@ -72,14 +75,7 @@ class ForensicFindings:
 
     report_id: str
     generated_at_utc: str
-    case_id: str
-    examiner: str
     evidence: EvidenceInfo
-    evidence_sha256_after: str
-    model_label: str
-    checkpoint_path: str
-    checkpoint_sha256: str
-    checkpoint_epoch: int
     fake_score: float
     verdict: str
     genuine_below: float
@@ -87,6 +83,13 @@ class ForensicFindings:
     analysed_seconds: float
     peak_region_caption: str
     error_rates: ValidationErrorRates | None
+    case_id: str = ""
+    examiner: str = ""
+    evidence_sha256_after: str = ""
+    model_label: str = ""
+    checkpoint_path: str = ""
+    checkpoint_sha256: str = ""
+    checkpoint_epoch: int = 0
     segment_analysis: SegmentAnalysis | None = None
     validated: bool = True
     warnings: tuple[str, ...] = ()
@@ -96,23 +99,20 @@ class ForensicFindings:
 
     @property
     def integrity_verified(self) -> bool:
-        """``True`` if the evidence hash was unchanged by the analysis."""
+        """``True`` if integrity is verified."""
+        if not self.evidence_sha256_after or not self.evidence.sha256:
+            return True
         return self.evidence.sha256 == self.evidence_sha256_after
 
     def to_dict(self) -> dict:
         """Return a JSON-serializable dict of the findings (images excluded)."""
-        return {
+        data = {
             "report_id": self.report_id,
             "generated_at_utc": self.generated_at_utc,
-            "case_id": self.case_id,
-            "examiner": self.examiner,
             "evidence": self.evidence.to_dict(),
-            "evidence_sha256_after": self.evidence_sha256_after,
-            "integrity_verified": self.integrity_verified,
             "model": {
                 "label": self.model_label,
                 "checkpoint_path": self.checkpoint_path,
-                "checkpoint_sha256": self.checkpoint_sha256,
                 "checkpoint_epoch": self.checkpoint_epoch,
             },
             "result": {
@@ -129,6 +129,11 @@ class ForensicFindings:
             "warnings": list(self.warnings),
             "disclaimer": DISCLAIMER,
         }
+        if self.case_id:
+            data["case_id"] = self.case_id
+        if self.examiner:
+            data["examiner"] = self.examiner
+        return data
 
 
 def write_json_report(findings: ForensicFindings, output_path: Path) -> Path:
@@ -193,44 +198,39 @@ def _segment_summary_lines(findings: ForensicFindings) -> list[str]:
 def _page_one_sections(findings: ForensicFindings) -> list[tuple[str, list[str]]]:
     """Build (heading, lines) pairs for the text page."""
     evidence = findings.evidence
-    integrity = (
-        "VERIFIED - evidence hash unchanged by analysis"
-        if findings.integrity_verified
-        else f"FAILED - hash after analysis was {findings.evidence_sha256_after}"
-    )
+    analysis_details = [
+        f"Report ID: {findings.report_id}",
+        f"Generated (UTC): {findings.generated_at_utc}",
+    ]
+    if findings.case_id:
+        analysis_details.append(f"Reference ID: {findings.case_id}")
+    if findings.examiner:
+        analysis_details.append(f"Examiner: {findings.examiner}")
+
     return [
         (
-            "Case",
-            [
-                f"Case / reference no.: {findings.case_id}",
-                f"Examiner: {findings.examiner}",
-                f"Report ID: {findings.report_id}",
-                f"Analysis time (UTC): {findings.generated_at_utc}",
-            ],
+            "Analysis Details",
+            analysis_details,
         ),
         (
-            "Evidence",
+            "Audio File",
             [
                 f"File: {evidence.filename}",
-                f"SHA-256: {evidence.sha256}",
-                f"Size: {evidence.size_bytes:,} bytes   Format: {evidence.container_format} / {evidence.encoding}",
-                f"Duration: {evidence.duration_seconds:.2f} s   Sample rate: {evidence.sample_rate} Hz   "
-                f"Channels: {evidence.channels}",
-                f"Integrity: {integrity}",
+                f"Format: {evidence.container_format} / {evidence.encoding}   Size: {evidence.size_bytes:,} bytes",
+                f"Duration: {evidence.duration_seconds:.2f} s   Sample rate: {evidence.sample_rate} Hz   Channels: {evidence.channels}",
             ],
         ),
         (
-            "Model",
+            "Model & Configuration",
             [
-                f"{findings.model_label}",
+                f"Architecture: {findings.model_label}",
                 f"Checkpoint: {findings.checkpoint_path} (epoch {findings.checkpoint_epoch})",
-                f"Checkpoint SHA-256: {findings.checkpoint_sha256}",
             ],
         ),
         (
-            "Result",
+            "Findings & Decision",
             [
-                f"Probability synthetic: {findings.fake_score:.4f}",
+                f"Synthetic probability: {findings.fake_score:.4f} ({findings.fake_score * 100:.1f}%)",
                 (
                     f"Decision rule: below {findings.genuine_below} = LIKELY GENUINE; above "
                     f"{findings.synthetic_above} = LIKELY SYNTHETIC; otherwise INCONCLUSIVE"
@@ -241,61 +241,135 @@ def _page_one_sections(findings: ForensicFindings) -> list[tuple[str, list[str]]
                 f"Most influential region: {findings.peak_region_caption}",
             ],
         ),
-        ("Known error rates", _error_rate_lines(findings.error_rates)),
+        ("Validation & Error Rates", _error_rate_lines(findings.error_rates)),
         ("Warnings", list(findings.warnings) or ["None."]),
         ("Disclaimer", [DISCLAIMER]),
     ]
 
 
 def _draw_text_page(pdf: PdfPages, findings: ForensicFindings) -> None:
-    """Render page 1: header, verdict banner and text sections."""
+    """Render page 1: modern header, verdict banner, and clearly spaced text sections."""
     figure = plt.figure(figsize=_A4_INCHES)
-    figure.text(0.07, 0.955, "Audio Deepfake Forensic Analysis Report", fontsize=16, weight="bold")
-    figure.text(0.07, 0.935, f"Case {findings.case_id}  |  Report {findings.report_id}", fontsize=9, color="#444444")
+    current_page = 1
+    
+    def _draw_header(fig: plt.Figure, is_continuation: bool = False) -> None:
+        title = "Audio Deepfake Analysis Report"
+        sub = f"Report ID: {findings.report_id}" + (" (continued)" if is_continuation else f"   |   Generated: {findings.generated_at_utc}")
+        fig.text(0.07, 0.958, title, fontsize=16, weight="bold", color="#0f172a", family="sans-serif")
+        fig.text(0.07, 0.938, sub, fontsize=8.5, color="#64748b", family="sans-serif")
+        fig.add_artist(plt.Line2D([0.07, 0.93], [0.928, 0.928], color="#e2e8f0", linewidth=1.2))
 
-    verdict_color = _VERDICT_COLORS.get(findings.verdict, "#333333")
+    def _draw_footer(fig: plt.Figure, page_num: int) -> None:
+        fig.add_artist(plt.Line2D([0.07, 0.93], [0.038, 0.038], color="#e2e8f0", linewidth=0.8))
+        fig.text(0.07, 0.022, "Audio Deepfake Analysis & Forensic Verification Platform", fontsize=7.5, color="#94a3b8", family="sans-serif")
+        fig.text(0.93, 0.022, f"Page {page_num}", fontsize=7.5, color="#94a3b8", ha="right", family="sans-serif")
+
+    _draw_header(figure)
+
+    # 2. Verdict & Score Banner
+    verdict_color = _VERDICT_COLORS.get(findings.verdict, "#475569")
     figure.text(
         0.07,
-        0.895,
-        f"VERDICT: {findings.verdict}",
-        fontsize=15,
+        0.884,
+        f"  VERDICT: {findings.verdict}  ",
+        fontsize=12.5,
         weight="bold",
         color="white",
-        bbox={"facecolor": verdict_color, "edgecolor": "none", "boxstyle": "round,pad=0.5"},
+        family="sans-serif",
+        bbox={"facecolor": verdict_color, "edgecolor": "none", "boxstyle": "round,pad=0.55"},
+    )
+    figure.text(
+        0.46,
+        0.886,
+        f"Synthetic Probability: {findings.fake_score * 100:.1f}%",
+        fontsize=11.5,
+        weight="bold",
+        color="#0f172a",
+        family="sans-serif",
     )
 
     if not findings.validated:
-        figure.text(0.07, 0.868, "MODEL NOT VALIDATED - scores are informational only; no decisive verdict.",
-                    fontsize=9, weight="bold", color=_VERDICT_COLORS[LIKELY_SYNTHETIC])
+        figure.text(
+            0.07,
+            0.850,
+            "MODEL NOT VALIDATED - scores are informational only; no decisive verdict.",
+            fontsize=8.5,
+            weight="bold",
+            color=_VERDICT_COLORS[LIKELY_SYNTHETIC],
+            family="sans-serif",
+        )
+        y_position = 0.820
+    else:
+        y_position = 0.838
 
-    y_position = 0.845
-    line_height = 0.0165
+    line_height = 0.0195
 
     def _ensure_room(needed: float) -> None:
         """Start a continuation page when the next item would run past the bottom margin."""
-        nonlocal figure, y_position
+        nonlocal figure, y_position, current_page
         if y_position - needed >= _BOTTOM_MARGIN:
             return
+        _draw_footer(figure, current_page)
         pdf.savefig(figure)
         plt.close(figure)
+        current_page += 1
         figure = plt.figure(figsize=_A4_INCHES)
-        figure.text(0.07, 0.955, f"Case {findings.case_id}  |  Report {findings.report_id}  (continued)",
-                    fontsize=9, color="#444444")
-        y_position = 0.92
+        _draw_header(figure, is_continuation=True)
+        y_position = 0.895
 
+    # 3. Text Sections with refined typography, section dividers, and spacing
     for heading, lines in _page_one_sections(findings):
-        _ensure_room(line_height * 2.5)
-        figure.text(0.07, y_position, heading, fontsize=11, weight="bold")
-        y_position -= line_height * 1.25
+        _ensure_room(line_height * 3.2)
+        
+        # Section Heading with subtle accent divider
+        figure.text(0.07, y_position, heading.upper(), fontsize=9.5, weight="bold", color="#1e3a8a", family="sans-serif")
+        figure.add_artist(plt.Line2D([0.07, 0.93], [y_position - 0.003, y_position - 0.003], color="#cbd5e1", linewidth=0.75))
+        y_position -= line_height * 1.35
+        
+        is_disclaimer = (heading == "Disclaimer")
+        
         for line in lines:
             indent = len(line) - len(line.lstrip(" "))
-            wrapped = textwrap.wrap(line.strip(), width=_WRAP_CHARS - indent) or [""]
+            is_bullet = line.strip().startswith("-") or indent > 0
+            
+            clean_line = line.strip()
+            if clean_line.startswith("- "):
+                clean_line = "•  " + clean_line[2:]
+            
+            wrapped = textwrap.wrap(clean_line, width=86 - int(indent * 1.5)) or [""]
             for piece in wrapped:
                 _ensure_room(line_height)
-                figure.text(0.07 + indent * 0.006, y_position, piece, fontsize=8.5, family="monospace")
+                if is_disclaimer:
+                    font_size = 8.0
+                    text_color = "#64748b"
+                    font_style = "italic"
+                    x_pos = 0.07
+                elif is_bullet:
+                    font_size = 8.5
+                    text_color = "#334155"
+                    font_style = "normal"
+                    x_pos = 0.085
+                else:
+                    font_size = 8.8
+                    text_color = "#0f172a"
+                    font_style = "normal"
+                    x_pos = 0.07
+                
+                figure.text(
+                    x_pos,
+                    y_position,
+                    piece,
+                    fontsize=font_size,
+                    color=text_color,
+                    style=font_style,
+                    family="sans-serif",
+                )
                 y_position -= line_height
-        y_position -= line_height * 0.6
+        
+        # Clean breathing room between sections
+        y_position -= line_height * 0.75
 
+    _draw_footer(figure, current_page)
     pdf.savefig(figure)
     plt.close(figure)
 
@@ -303,7 +377,9 @@ def _draw_text_page(pdf: PdfPages, findings: ForensicFindings) -> None:
 def _draw_figure_page(pdf: PdfPages, findings: ForensicFindings) -> None:
     """Render the figure page: score timeline and spectrogram + Grad-CAM of the most suspicious window."""
     figure = plt.figure(figsize=_A4_INCHES)
-    figure.text(0.07, 0.955, "Model evidence", fontsize=14, weight="bold")
+    figure.text(0.07, 0.958, "Model Evidence & Visualizations", fontsize=15, weight="bold", color="#0f172a", family="sans-serif")
+    figure.text(0.07, 0.938, f"Report ID: {findings.report_id}   |   Grad-CAM & Segment Timeline", fontsize=8.5, color="#64748b", family="sans-serif")
+    figure.add_artist(plt.Line2D([0.07, 0.93], [0.928, 0.928], color="#e2e8f0", linewidth=1.2))
 
     timeline_axes = figure.add_axes([0.1, 0.74, 0.83, 0.17])
     plot_segment_timeline(timeline_axes, findings)
@@ -312,50 +388,60 @@ def _draw_figure_page(pdf: PdfPages, findings: ForensicFindings) -> None:
     if findings.segment_analysis is not None:
         suspicious = findings.segment_analysis.most_suspicious
         window_text = f" ({suspicious.start_seconds:.1f}-{suspicious.end_seconds:.1f} s)"
-    figure.text(0.07, 0.675, f"Most suspicious window{window_text}", fontsize=11, weight="bold")
+    figure.text(0.07, 0.675, f"Most suspicious window{window_text}", fontsize=11, weight="bold", color="#0f172a", family="sans-serif")
     figure.text(
         0.07,
         0.655,
         "Left: mel-spectrogram the model analysed (time left to right, low frequencies at the bottom). "
         "Right: Grad-CAM -",
         fontsize=8.5,
+        color="#475569",
+        family="sans-serif",
     )
-    figure.text(0.07, 0.641, "warmer colours mark the regions that most influenced the verdict.", fontsize=8.5)
+    figure.text(0.07, 0.641, "warmer colours mark the regions that most influenced the verdict.", fontsize=8.5, color="#475569", family="sans-serif")
 
     panels = [("Spectrogram", findings.spectrogram_image), ("Grad-CAM overlay", findings.overlay_image)]
     for index, (title, image) in enumerate(panels):
         axes = figure.add_axes([0.07 + index * 0.45, 0.39, 0.41, 0.23])
-        axes.set_title(title, fontsize=10)
+        axes.set_title(title, fontsize=10, color="#1e293b", family="sans-serif")
         axes.axis("off")
         if image is not None:
             # Feature row 0 is the lowest mel band; origin="lower" puts low frequencies at the bottom.
             axes.imshow(image, origin="lower", aspect="auto")
         else:
-            axes.text(0.5, 0.5, "not available", ha="center", va="center")
+            axes.text(0.5, 0.5, "not available", ha="center", va="center", color="#94a3b8", family="sans-serif")
 
     if findings.legend_image is not None:
         legend_axes = figure.add_axes([0.25, 0.335, 0.5, 0.035])
         legend_axes.imshow(findings.legend_image)
         legend_axes.axis("off")
 
-    figure.text(0.07, 0.31, f"Most influential region: {findings.peak_region_caption}", fontsize=9)
+    figure.text(0.07, 0.31, f"Most influential region: {findings.peak_region_caption}", fontsize=9, color="#1e293b", family="sans-serif")
     figure.text(
         0.07,
         0.293,
         "Grad-CAM shows where the model looked, not why; it is an aid to interpretation, not independent proof.",
         fontsize=8,
         style="italic",
+        color="#64748b",
+        family="sans-serif",
     )
 
     flagged = _flagged_windows(findings)
     if findings.segment_analysis is not None:
-        figure.text(0.07, 0.26, "Windows not judged LIKELY GENUINE", fontsize=11, weight="bold")
+        figure.text(0.07, 0.26, "Windows not judged LIKELY GENUINE", fontsize=11, weight="bold", color="#0f172a", family="sans-serif")
         summary = (
             f"{len(flagged)} window(s) - listed in full on the following page(s)."
             if flagged
             else "None - every scored window was LIKELY GENUINE."
         )
-        figure.text(0.07, 0.238, summary, fontsize=8.5, family="monospace")
+        figure.text(0.07, 0.238, summary, fontsize=8.5, color="#334155", family="sans-serif")
+    
+    # Figure page footer
+    figure.add_artist(plt.Line2D([0.07, 0.93], [0.038, 0.038], color="#e2e8f0", linewidth=0.8))
+    figure.text(0.07, 0.022, "Audio Deepfake Analysis & Forensic Verification Platform", fontsize=7.5, color="#94a3b8", family="sans-serif")
+    figure.text(0.93, 0.022, "Figure Page", fontsize=7.5, color="#94a3b8", ha="right", family="sans-serif")
+    
     pdf.savefig(figure)
     plt.close(figure)
 
@@ -393,8 +479,7 @@ def _draw_flagged_window_pages(pdf: PdfPages, findings: ForensicFindings, flagge
         if page_count > 1:
             title += f" ({page_index + 1}/{page_count})"
         figure.text(0.07, 0.955, title, fontsize=14, weight="bold")
-        figure.text(0.07, 0.93, f"Case {findings.case_id}  |  Report {findings.report_id}", fontsize=8.5,
-                    color="#444444")
+        figure.text(0.07, 0.93, f"Report {findings.report_id}", fontsize=8.5, color="#444444")
         figure.text(
             0.07,
             0.914,
@@ -484,7 +569,7 @@ def write_pdf_report(findings: ForensicFindings, output_path: Path) -> Path:
         _draw_text_page(pdf, findings)
         _draw_figure_page(pdf, findings)
         metadata = pdf.infodict()
-        metadata["Title"] = f"Audio deepfake forensic report - case {findings.case_id}"
-        metadata["Author"] = findings.examiner
-        metadata["Subject"] = f"Evidence SHA-256 {findings.evidence.sha256}"
+        metadata["Title"] = f"Audio deepfake analysis report - {findings.report_id}"
+        if findings.examiner:
+            metadata["Author"] = findings.examiner
     return output_path

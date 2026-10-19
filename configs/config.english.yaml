@@ -1,0 +1,125 @@
+# Production English Multi-Source Config: WaveFake + ASVspoof 2019 LA
+# High-resolution (224x224) transcript-paired bilingual pipeline.
+paths:
+  data_dir: "data/english"
+  raw_dir: "data/english/raw"
+  processed_dir: "data/english/processed"
+  feature_dir: "data/english/features"
+  metadata_dir: "data/english/metadata"
+  metadata_file: "data/english/metadata/metadata.csv"
+  log_dir: "logs/english"
+  checkpoint_dir: "checkpoints/english"
+  output_dir: "outputs/english"
+  explanation_dir: "outputs/english/explanations"
+
+audio:
+  sample_rate: 16000
+  mono: true
+  target_duration_seconds: 4
+  remove_silence: true
+  top_db: 30
+  normalize: true
+  pad_mode: "constant"
+  supported_formats: [".wav", ".flac", ".mp3", ".ogg"]
+
+dataset:
+  languages: ["english"]
+  labels: ["real", "fake"]
+  train_ratio: 0.70
+  val_ratio: 0.15
+  test_ratio: 0.15
+  random_seed: 42
+
+ingestion:
+  language: "english"
+  hf_token_env_var: "HF_TOKEN"
+  real:
+    - dataset: "ajaykarthick/wavefake-audio"
+      config_name: null
+      split: "train"
+      label: "real"
+      audio_field: "audio"
+      target_count: 1000
+      source_tag: "real_wf"
+      filters:
+        - field: "real_or_fake"
+          value: "R"
+  fake:
+    - dataset: "ajaykarthick/wavefake-audio"
+      config_name: null
+      split: "train"
+      label: "fake"
+      audio_field: "audio"
+      target_count: 1000
+      source_tag: "fake_wf"
+      filters:
+        - field: "real_or_fake"
+          value: "WF1"
+
+features:
+  type: "mel_spectrogram"
+  n_mels: 128
+  n_mfcc: 40
+  n_lfcc: 40
+  n_fft: 1024
+  hop_length: 512
+  win_length: 1024
+  fmin: 0
+  fmax: 8000
+  power: 2.0
+  log_scale: true
+  image_size: 224
+
+model:
+  backbone: "efficientnet_b0"
+  pretrained: true
+  num_classes: 2
+  use_bilstm: false
+  lstm_hidden_size: 256
+  lstm_num_layers: 2
+  lstm_bidirectional: true
+  dropout: 0.3
+  freeze_backbone: false
+
+training:
+  batch_size: 32
+  num_epochs: 25
+  learning_rate: 0.0003
+  weight_decay: 0.00001
+  optimizer: "adamw"
+  scheduler: "cosine"
+  early_stopping_patience: 6
+  early_stopping_min_delta: 0.0001
+  mixed_precision: true
+  gradient_clip_norm: 5.0
+  num_workers: 2
+  checkpoint_metric: "val_f1"
+  resume: false
+
+evaluation:
+  metrics: ["accuracy", "precision", "recall", "f1", "roc_auc", "eer", "confusion_matrix"]
+  threshold: 0.5
+
+explainability:
+  method: "gradcam"
+  target_layer: "backbone.conv_head"
+  overlay_alpha: 0.5
+  colormap: "jet"
+
+deployment:
+  host: "0.0.0.0"
+  port: 5000
+  debug: false
+  max_upload_size_mb: 25
+  allowed_extensions: [".wav", ".flac", ".mp3", ".ogg"]
+  model_checkpoint: "checkpoints/english/best_model.pt"
+
+forensics:
+  genuine_below: 0.15
+  synthetic_above: 0.85
+  segment_window_seconds: 4.0
+  segment_hop_seconds: 2.0
+  min_speech_fraction: 0.10
+  validation_scores: "outputs/english/cross_source_scores.json"
+  report_dir: "outputs/forensic_reports"
+  custody_log: "outputs/forensic_reports/custody_log.jsonl"

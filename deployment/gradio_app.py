@@ -69,7 +69,14 @@ _PAIRED_SOURCE_ROOTS: tuple[tuple[str, str, str], ...] = (
 #: ``validation`` split, so they are clips this model has never seen.
 _LANGUAGE_MODELS: dict[str, dict[str, object]] = {
     "Hindi": {"checkpoint": "checkpoints/paper_seaspoof_paired/seed_42/best_model.pt", "image_size": 224},
-    "English": {"checkpoint": "checkpoints/english_smoke/best_model.pt", "image_size": 128},
+    "English": {
+        "checkpoint": (
+            "checkpoints/english/best_model.pt"
+            if (_ROOT_DIR / "checkpoints/english/best_model.pt").exists()
+            else "checkpoints/english_smoke/best_model.pt"
+        ),
+        "image_size": 224 if (_ROOT_DIR / "checkpoints/english/best_model.pt").exists() else 128,
+    },
 }
 
 _MAX_EXAMPLE_PAIRS_PER_SOURCE = 2
@@ -207,12 +214,12 @@ def create_demo(services: dict[str, InferenceService] | None = None) -> gr.Block
             fake_label, fake_processed, fake_spec, fake_overlay, fake_caption,
         )
 
-    def run_forensic_analysis(model_choice: str | None, audio_path: str | None, case_id: str, examiner: str) -> tuple:
-        """Analyse one evidence clip, returning a verdict summary and the PDF/JSON reports."""
+    def run_audio_analysis(model_choice: str | None, audio_path: str | None) -> tuple:
+        """Analyse one audio recording, returning a verdict summary and the PDF/JSON reports."""
         if model_choice is None:
             raise gr.Error("Choose the model matching the recording's language first.")
         if audio_path is None:
-            raise gr.Error("Upload an evidence audio file first.")
+            raise gr.Error("Upload an audio file first.")
         language = forensic_choice_to_language[model_choice]
         service = services.get(language)
         if service is None:
@@ -220,8 +227,6 @@ def create_demo(services: dict[str, InferenceService] | None = None) -> gr.Block
         try:
             analysis = analyze_evidence(
                 Path(audio_path),
-                case_id=case_id or "",
-                examiner=examiner or "",
                 service=service,
                 model_label=f"EfficientNet-B0 deepfake detector, {language} ({service.checkpoint_path.parent.name})",
             )
@@ -238,9 +243,7 @@ def create_demo(services: dict[str, InferenceService] | None = None) -> gr.Block
                 if findings.validated
                 else "(informational only - this model has no measured error rate)"
             ),
-            f"Evidence SHA-256: `{findings.evidence.sha256}` — integrity "
-            f"{'verified' if findings.integrity_verified else '**FAILED**'}",
-            f"Report ID: `{findings.report_id}` (recorded in the chain-of-custody log)",
+            f"Report ID: `{findings.report_id}`",
         ]
         if findings.error_rates is None:
             lines.append("**MODEL NOT VALIDATED** - no decisive verdict is issued; do not use this as evidence.")
@@ -277,11 +280,65 @@ def create_demo(services: dict[str, InferenceService] | None = None) -> gr.Block
             "See the project README for cross-source generalization caveats."
         )
 
-        language_selector = gr.Radio(
-            choices=language_choices,
-            value=language_choices[0],
-            label="Model / language",
-            info="Each language has its own trained checkpoint -- pick the one matching your clip's language.",
+        gr.HTML(
+            """
+            <style>
+            .equal-split-row {
+                display: flex !important;
+                flex-direction: row !important;
+                gap: 16px !important;
+                width: 100% !important;
+            }
+            .equal-split-col {
+                flex: 1 1 0px !important;
+                width: 50% !important;
+                max-width: 50% !important;
+                min-width: 0 !important;
+                box-sizing: border-box !important;
+            }
+            .equal-split-col > div,
+            .equal-split-col .block,
+            .equal-split-col [data-testid="file"] {
+                width: 100% !important;
+                box-sizing: border-box !important;
+            }
+            </style>
+            """
+        )
+
+        with gr.Row():
+            with gr.Column(scale=4):
+                language_selector = gr.Radio(
+                    choices=language_choices,
+                    value=language_choices[0],
+                    label="Model / language",
+                    info="Each language has its own trained checkpoint -- pick the one matching your clip's language.",
+                )
+            with gr.Column(scale=1):
+                theme_selector = gr.Radio(
+                    choices=["Dark", "Light"],
+                    value="Dark",
+                    label="Theme",
+                    info="Switch interface color theme",
+                )
+
+        theme_selector.change(
+            fn=None,
+            inputs=[theme_selector],
+            js="""(theme) => {
+                const isDark = (theme || '').toLowerCase() === 'dark';
+                const html = document.documentElement;
+                const body = document.body;
+                if (isDark) {
+                    html.classList.add('dark');
+                    body.classList.add('dark');
+                    document.querySelectorAll('.gradio-container').forEach(el => el.classList.add('dark'));
+                } else {
+                    html.classList.remove('dark');
+                    body.classList.remove('dark');
+                    document.querySelectorAll('.gradio-container').forEach(el => el.classList.remove('dark'));
+                }
+            }""",
         )
 
         with gr.Tabs():
@@ -345,13 +402,12 @@ def create_demo(services: dict[str, InferenceService] | None = None) -> gr.Block
                     outputs=outputs,
                 )
 
-            with gr.Tab("Forensic analysis"):
+            with gr.Tab("Audio analysis"):
                 gr.Markdown(
-                    "Analyse one evidence recording for a case. The file is hashed (SHA-256) before "
-                    "and after analysis, given a three-way verdict (likely genuine / inconclusive / "
-                    "likely synthetic) with the model's known error rates, and recorded in a "
-                    "tamper-evident chain-of-custody log. Download the PDF report below. "
-                    "**The result supports, and does not replace, expert examination.**"
+                    "Analyse an audio recording. The recording is scored in windows across time, "
+                    "given a three-way verdict (likely genuine / inconclusive / likely synthetic) "
+                    "with the model's known error rates, and explained with Grad-CAM. Download the "
+                    "PDF and JSON reports below."
                 )
                 forensic_model_selector = gr.Radio(
                     choices=list(forensic_choice_to_language),
@@ -360,27 +416,28 @@ def create_demo(services: dict[str, InferenceService] | None = None) -> gr.Block
                     info="Hindi audio needs the Hindi model and English audio the English model; "
                     "using the wrong one gives meaningless results.",
                 )
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        # gr.File, not gr.Audio: the evidence must be hashed byte-for-byte as
-                        # uploaded, and gr.Audio may re-encode the upload before we see it.
+                with gr.Row(elem_classes=["equal-split-row"]):
+                    with gr.Column(scale=1, min_width=0, elem_classes=["equal-split-col"]):
                         evidence_input = gr.File(
-                            label="Evidence audio (wav, mp3, ogg/opus, m4a, amr, ...)",
+                            label="Audio file (wav, mp3, ogg/opus, m4a, amr, ...)",
                             file_types=list(CONFIG.deployment.allowed_extensions),
                             type="filepath",
+                            height=220,
                         )
-                        case_id_input = gr.Textbox(label="Case / FIR / reference no.")
-                        examiner_input = gr.Textbox(label="Examiner name")
-                        forensic_button = gr.Button("Run forensic analysis", variant="primary")
-                    with gr.Column(scale=1):
-                        forensic_summary = gr.Markdown()
-                        forensic_files = gr.File(label="Report (PDF + JSON)", file_count="multiple")
+                        forensic_button = gr.Button("Run analysis", variant="primary")
+                    with gr.Column(scale=1, min_width=0, elem_classes=["equal-split-col"]):
+                        forensic_files = gr.File(
+                            label="Report (PDF + JSON)",
+                            file_count="multiple",
+                            height=220,
+                        )
+                forensic_summary = gr.Markdown()
                 forensic_timeline = gr.Image(label="Score per window across the recording")
                 forensic_gradcam = gr.Image(label="Grad-CAM (most suspicious window)")
 
                 forensic_button.click(
-                    fn=run_forensic_analysis,
-                    inputs=[forensic_model_selector, evidence_input, case_id_input, examiner_input],
+                    fn=run_audio_analysis,
+                    inputs=[forensic_model_selector, evidence_input],
                     outputs=[forensic_summary, forensic_timeline, forensic_gradcam, forensic_files],
                 )
 

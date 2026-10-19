@@ -41,23 +41,23 @@ class EvidenceInfo:
 
     Attributes:
         filename: Original file name (no directory).
-        sha256: SHA-256 hex digest of the file's bytes.
         size_bytes: File size in bytes.
         duration_seconds: Audio duration.
         sample_rate: Native sample rate in Hz.
         channels: Number of audio channels.
         container_format: Container reported by libsndfile, e.g. ``"WAV"``.
         encoding: Sample encoding reported by libsndfile, e.g. ``"PCM_16"``.
+        sha256: Optional SHA-256 hex digest.
     """
 
     filename: str
-    sha256: str
     size_bytes: int
     duration_seconds: float
     sample_rate: int
     channels: int
     container_format: str
     encoding: str
+    sha256: str = ""
 
     @property
     def is_lossy(self) -> bool:
@@ -66,16 +66,21 @@ class EvidenceInfo:
 
     def to_dict(self) -> dict:
         """Return a JSON-serializable dict of every field."""
-        return {**asdict(self), "is_lossy": self.is_lossy}
+        data = asdict(self)
+        data["is_lossy"] = self.is_lossy
+        if not self.sha256:
+            data.pop("sha256", None)
+        return data
 
 
-def describe_evidence(path: Path, display_name: str | None = None) -> EvidenceInfo:
-    """Hash an audio file and read its technical metadata without decoding samples.
+def describe_evidence(path: Path, display_name: str | None = None, compute_hash: bool = True) -> EvidenceInfo:
+    """Read technical metadata of an audio file without decoding samples.
 
     Args:
         path: Audio file on disk.
         display_name: Name to record instead of ``path.name`` -- e.g. the
             original upload name when ``path`` is a temporary copy.
+        compute_hash: Whether to compute SHA-256 digest (default: True).
 
     Returns:
         An :class:`EvidenceInfo` for the file.
@@ -88,11 +93,11 @@ def describe_evidence(path: Path, display_name: str | None = None) -> EvidenceIn
 
     return EvidenceInfo(
         filename=display_name or path.name,
-        sha256=sha256_file(path),
         size_bytes=path.stat().st_size,
         duration_seconds=info.duration_seconds,
         sample_rate=info.sample_rate,
         channels=info.channels,
         container_format=info.container_format,
         encoding=info.encoding,
+        sha256=sha256_file(path) if compute_hash else "",
     )
