@@ -243,7 +243,6 @@ def create_demo(services: dict[str, InferenceService] | None = None) -> gr.Block
                 if findings.validated
                 else "(informational only - this model has no measured error rate)"
             ),
-            f"Report ID: `{findings.report_id}`",
         ]
         if findings.error_rates is None:
             lines.append("**MODEL NOT VALIDATED** - no decisive verdict is issued; do not use this as evidence.")

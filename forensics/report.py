@@ -184,22 +184,31 @@ def _segment_summary_lines(findings: ForensicFindings) -> list[str]:
     scored = analysis.scored
     flagged = sum(segment.verdict == LIKELY_SYNTHETIC for segment in scored)
     inconclusive = sum(segment.verdict == INCONCLUSIVE for segment in scored)
+    genuine = sum(segment.verdict == LIKELY_GENUINE for segment in scored)
     suspicious = analysis.most_suspicious
-    return [
+    summary = [
         f"Coverage: whole recording, {len(analysis.segments)} window(s) of {analysis.window_seconds:.1f} s "
         f"every {analysis.hop_seconds:.1f} s; {len(scored)} scored, "
         f"{len(analysis.segments) - len(scored)} skipped as silence",
-        f"Windows LIKELY SYNTHETIC: {flagged}   INCONCLUSIVE: {inconclusive}",
-        f"Verdict taken from the most suspicious window: {suspicious.start_seconds:.1f}-"
-        f"{suspicious.end_seconds:.1f} s (explained by the Grad-CAM figure)",
+        f"Windows: LIKELY GENUINE: {genuine}   INCONCLUSIVE: {inconclusive}   LIKELY SYNTHETIC: {flagged}",
     ]
+    if flagged == 0:
+        summary.append(
+            f"Verdict: Consistent genuine consensus across speech windows (peak explained window: {suspicious.start_seconds:.1f}-"
+            f"{suspicious.end_seconds:.1f} s)"
+        )
+    else:
+        summary.append(
+            f"Verdict: Multi-window consensus evaluation (most suspicious window: {suspicious.start_seconds:.1f}-"
+            f"{suspicious.end_seconds:.1f} s explained by Grad-CAM)"
+        )
+    return summary
 
 
 def _page_one_sections(findings: ForensicFindings) -> list[tuple[str, list[str]]]:
     """Build (heading, lines) pairs for the text page."""
     evidence = findings.evidence
     analysis_details = [
-        f"Report ID: {findings.report_id}",
         f"Generated (UTC): {findings.generated_at_utc}",
     ]
     if findings.case_id:
@@ -569,7 +578,7 @@ def write_pdf_report(findings: ForensicFindings, output_path: Path) -> Path:
         _draw_text_page(pdf, findings)
         _draw_figure_page(pdf, findings)
         metadata = pdf.infodict()
-        metadata["Title"] = f"Audio deepfake analysis report - {findings.report_id}"
+        metadata["Title"] = f"Audio deepfake analysis report - {findings.evidence.filename}"
         if findings.examiner:
             metadata["Author"] = findings.examiner
     return output_path
